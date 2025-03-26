@@ -133,11 +133,10 @@ def run(rank, world_size):
         S = CONTEXT_LENGTH
         np_heads = NUM_HEADS
         h_dim = HEAD_DIM
-        fill_value = value_map.get(bench_name, 1.0)
-
-        q = torch.full((B, S, np_heads, h_dim), fill_value, device=device, dtype=torch.float16)
-        k = torch.full((B, S, np_heads, h_dim), fill_value, device=device, dtype=torch.float16)
-        v = torch.full((B, S, np_heads, h_dim), fill_value, device=device, dtype=torch.float16)
+        # use random tokens for a more realistic test
+        q = torch.randn((B, S, np_heads, h_dim), device=device, dtype=torch.float16)
+        k = torch.randn((B, S, np_heads, h_dim), device=device, dtype=torch.float16)
+        v = torch.randn((B, S, np_heads, h_dim), device=device, dtype=torch.float16)
 
         # enable gradient tracking
         q.requires_grad = True
@@ -145,6 +144,10 @@ def run(rank, world_size):
         v.requires_grad = True
 
         # forward pass
+        # timing the forward pass
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
         out = AttnFuncWithCPAndKVAllGather.apply(
             is_training,
             q,
@@ -166,8 +169,14 @@ def run(rank, world_size):
             cp_group,
             cp_stream,
         )
-
+        end_event.record()
         torch.cuda.synchronize(device)
+        time_ms = start_event.elapsed_time(end_event)
+        # record FLOPs performance: FLOPs = 4 * B * S^2 * HEAD_DIM * NUM_HEADS
+        flops = 4 * B * (S ** 2) * HEAD_DIM * NUM_HEADS
+        time_sec = time_ms / 1000.0
+        tflops = flops / (time_sec * 1e12)
+        print(f"Rank {rank} Benchmark {bench_name}: TFLOPS: {tflops:.2f}")
 
         # in the non-fused branch with "bshd", the output is flattened to [S, num_heads, head_dim]
         if not use_fused_attention and qkv_format == "bshd":
