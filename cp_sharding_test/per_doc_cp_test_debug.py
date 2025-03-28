@@ -12,7 +12,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from transformer_engine.pytorch.attention import AttnFuncWithCPAndKVAllGather
-from per_document_cp_sharding.per_document_cp_sharding import AttnFuncWithCPAndPerDocKVAllGather
+from per_document_cp_sharding.per_document_cp_sharding import AttnFuncWithPerDocRoundRobinSharding
 from transformer_engine.pytorch.distributed import get_distributed_world_size, get_distributed_rank
 from transformer_engine.pytorch.utils import nvtx_range_push, nvtx_range_pop
 
@@ -140,7 +140,7 @@ def run(rank, world_size, doc_lens):
     out_seq = out_seq.view(1, CONTEXT_LENGTH, D)
 
     # run per-document CP sharding
-    out_doc = AttnFuncWithCPAndPerDocKVAllGather.apply(
+    out_doc = AttnFuncWithPerDocRoundRobinSharding.apply(
         is_training,
         q_doc,
         k_doc,

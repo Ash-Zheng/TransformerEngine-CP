@@ -1,6 +1,5 @@
 import torch
 from torch.autograd import Function
-import math
 import torch.distributed as dist
 
 from transformer_engine.pytorch.distributed import (
@@ -12,288 +11,383 @@ from transformer_engine.pytorch.utils import (
     nvtx_range_pop,
 )
 
-DEBUG = True
-def debug_log(msg):
-    if DEBUG:
-        print(msg)
+###############################################################################
+# Utility functions
+###############################################################################
 
-class AttnFuncWithCPAndPerDocKVAllGather(Function):
-    """
-    Per-document CP sharding implementation with enhanced logging for debugging.
+def gather_along_first_dim(tensor: torch.Tensor, group):
+    world_size = dist.get_world_size(group)
+    chunks = [torch.empty_like(tensor) for _ in range(world_size)]
+    dist.all_gather(chunks, tensor, group=group)
+    return torch.cat(chunks, dim=0)
+
+def reduce_scatter_along_first_dim(tensor: torch.Tensor, group):
+    world_size = dist.get_world_size(group)
+    chunk_size = tensor.shape[0] // world_size
+    splits = list(torch.split(tensor, chunk_size, dim=0))
+    out = torch.zeros_like(splits[0])
+    dist.reduce_scatter(out, splits, group=group)
+    return out
+
+def compute_divisible_and_leftover(L, cp_size):
+    D = (L // (2*cp_size)) * (2*cp_size)
+    R = L - D
+    return D, R
+
+def forward_attn_chunk(q_chunk, k_chunk, v_chunk, softmax_scale, causal, is_training, dropout_p):
+    attn_scores = torch.matmul(q_chunk, k_chunk.transpose(-2, -1)) * softmax_scale
+    if causal:
+        Lq = q_chunk.size(1)
+        Lk = k_chunk.size(1)
+        idx_q = torch.arange(Lq, device=q_chunk.device).view(Lq, 1)
+        idx_k = torch.arange(Lk, device=q_chunk.device).view(1, Lk)
+        mask = (idx_k <= idx_q)
+        attn_scores.masked_fill_(~mask, float('-inf'))
+    attn_probs = torch.softmax(attn_scores, dim=-1)
+    if is_training and dropout_p > 0:
+        attn_probs = torch.nn.functional.dropout(attn_probs, p=dropout_p, training=True)
+    out_chunk = torch.matmul(attn_probs, v_chunk)
+    return out_chunk, attn_probs
+
+def backward_attn_chunk(dout, attn_probs, q_chunk, k_chunk, v_chunk, softmax_scale):
+    dV = torch.matmul(attn_probs.transpose(-2, -1), dout)
+    dA = torch.matmul(dout, v_chunk.transpose(-2, -1))
+    dScores = attn_probs * (dA - (dA * attn_probs).sum(dim=-1, keepdim=True))
+    dScores *= softmax_scale
+    dQ = torch.matmul(dScores, k_chunk)
+    dK = torch.matmul(dScores.transpose(-2, -1), q_chunk)
+    return dQ, dK, dV
+
+###############################################################################
+# Main Class: Per-document CP sharding with round-robin distribution.
+###############################################################################
+
+class AttnFuncWithPerDocRoundRobinSharding(Function):
+    r"""
+    Per-document CP sharding with round-robin distribution.
     
-    In the forward pass, we pad each document (if needed), compute balanced boundaries,
-    and reshape the padded tensor into N equal chunks. We store these padded tensors
-    and boundaries for use in the backward pass.
+    This implementation splits each document into a “divisible” portion (of length D_i,
+    a multiple of 2*cp_size) and a leftover portion. For each portion, it gathers K,V 
+    from all ranks, reshapes them into a 4D tensor of shape [2*cp_size, chunk_len, B, D],
+    and then processes the local Q in chunks. In the case where the local portion length
+    is less than 2*cp_size (i.e. cannot be evenly split), we simply process the entire tensor
+    with vanilla attention. The final output is a flat tensor of shape [B, S, D] (with D = nHeads*headDim).
     
-    The backward pass then uses these stored tensors and boundaries to reconstruct the
-    same views as in the forward pass, ensuring that gradient slices are computed on the
-    exact same “chunked” tensors.
+    Remember to call dist.destroy_process_group() when done to avoid NCCL warnings.
     """
+
     @staticmethod
     def forward(ctx,
                 is_training,
-                q,         # [B, S, num_heads, head_dim]
-                k,         # [B, S, num_heads, head_dim]
-                v,         # [B, S, num_heads, head_dim]
-                doc_lens,  # list or 1D tensor; sum(doc_lens)==S
+                q, k, v,      # [B, S, nHeads, headDim]
+                doc_lens,     # list (or tensor) of document lengths (sum = S)
                 dropout_p,
                 softmax_scale,
                 qkv_format,
-                attn_mask_type, 
-                attn_bias_type, 
+                attn_mask_type,
+                attn_bias_type,
                 attn_bias,
                 deterministic,
-                use_fused_attention,  # must be False
-                window_size,          # unused here
+                use_fused_attention,
+                window_size,
                 cp_group,
                 cp_stream):
-        nvtx_range_push("AttnFuncWithCPAndPerDocKVAllGather.forward")
-        orig_shape = q.shape  # [B, S, num_heads, head_dim]
-        B, S, num_heads, head_dim = orig_shape
-        D = num_heads * head_dim
-        ctx.orig_shape = orig_shape
-        ctx.num_heads = num_heads
-        ctx.head_dim = head_dim
 
-        # merge head dimensions
-        q = q.view(B, S, D)
-        k = k.view(B, S, D)
-        v = v.view(B, S, D)
+        nvtx_range_push("AttnFuncWithPerDocRoundRobinSharding.forward")
+
+        B, S, nHeads, headDim = q.shape
+        D = nHeads * headDim
+        # Flatten Q, K, V to [B, S, D]
+        q_2d = q.view(B, S, D)
+        k_2d = k.view(B, S, D)
+        v_2d = v.view(B, S, D)
+
         if softmax_scale is None:
-            softmax_scale = D ** (-0.5)
-        rank = get_distributed_rank(cp_group)
-        cp_size = get_distributed_world_size(cp_group)
-        causal = "causal" in attn_mask_type
-        assert attn_bias_type == "no_bias", f"{attn_bias_type} bias type not supported!"
-        assert D % 8 == 0, "Merged hidden dimension must be a multiple of 8!"
-        assert not use_fused_attention, "Flash attention not supported in per-document CP sharding."
+            softmax_scale = 1.0 / (headDim ** 0.5)
 
-        # compute document boundaries
+        cp_size = dist.get_world_size(cp_group)
+        rank = dist.get_rank(cp_group)
+        causal = ("causal" in attn_mask_type)
+
+        out_2d = torch.zeros_like(q_2d)
+
         if isinstance(doc_lens, torch.Tensor):
             doc_lens = doc_lens.tolist()
+
+        # Compute document boundaries.
         boundaries = [0]
         for l in doc_lens:
             boundaries.append(boundaries[-1] + int(l))
-        num_docs = len(doc_lens)
-        ctx.boundaries = boundaries
 
-        # helper: compute balanced (padded) boundaries for a document of length L split into N chunks
-        def balanced_boundaries(L, N):
-            seg_len = L // N
-            rem = L % N
-            bnds = [0]
-            for j in range(N):
-                bnds.append(bnds[-1] + seg_len + (1 if j < rem else 0))
-            return bnds
+        saved_divisible = []
+        saved_leftover = []
+        local_seq_chunk_ids = [rank, (2 * cp_size - rank - 1)]
 
-        # lists to store padded tensors and boundaries for each document
-        ctx.doc_padded = []   # list of dict per document
-        ctx.shard_info = []   # list of dict per document
-        ctx.attn_probs = []   # list of tuple (attn_probs0, attn_probs1) per document
+        # Helper for forward on one chunk.
+        def sym_chunk_fwd(q_loc, k_loc, v_loc):
+            print(f"[sym_chunk_fwd] q_loc shape: {q_loc.shape}, k_loc shape: {k_loc.shape}")
+            local_len = q_loc.shape[0]
+            # If local portion is too small to split among 2*cp_size, process whole.
+            if local_len < 2 * cp_size:
+                print(f"[sym_chunk_fwd] local_len {local_len} < 2*cp_size {2*cp_size}, processing as single chunk")
+                q_loc_2d = q_loc.movedim(0, 1)
+                k_loc_2d = k_loc.movedim(0, 1)
+                v_loc_2d = v_loc.movedim(0, 1)
+                out_chunk, attn_probs_ = forward_attn_chunk(q_loc_2d, k_loc_2d, v_loc_2d, softmax_scale, causal, is_training, dropout_p)
+                step_saves = {"q_sub_0": q_loc, "k_sub_0": k_loc, "v_sub_0": v_loc}
+                attn_probs_steps = [attn_probs_, None]
+                return out_chunk.movedim(1, 0), gather_along_first_dim(k_loc, cp_group), gather_along_first_dim(v_loc, cp_group), step_saves, attn_probs_steps
 
-        output = q.new_zeros(B, S, D)
-        N = 2 * cp_size
+            chunk_len = local_len // 2
+            print(f"[sym_chunk_fwd] local_len: {local_len}, chunk_len: {chunk_len}")
+            gather_k = gather_along_first_dim(k_loc, cp_group)
+            gather_v = gather_along_first_dim(v_loc, cp_group)
+            print(f"[sym_chunk_fwd] gather_k shape: {gather_k.shape}")
+            # Reshape gathered k,v to [2*cp_size, chunk_len, B, D]
+            k_4d = gather_k.view(2 * cp_size, chunk_len, B, D)
+            v_4d = gather_v.view(2 * cp_size, chunk_len, B, D)
+            out_loc = torch.zeros_like(q_loc)
+            step_saves = {}
+            attn_probs_steps = [None, None]
+            for step_i in range(len(local_seq_chunk_ids) + 1):
+                if step_i < len(local_seq_chunk_ids):
+                    c_id = local_seq_chunk_ids[step_i]
+                    row_start = c_id * chunk_len
+                    row_end = row_start + chunk_len
+                    rs = max(0, min(row_start, local_len))
+                    re = max(0, min(row_end, local_len))
+                    L_sub = re - rs
+                    if L_sub <= 0:
+                        continue
+                    q_sub = q_loc[rs:re]
+                    # Safety check on c_id
+                    if c_id < 0 or c_id >= 2 * cp_size:
+                        continue
+                    k_sub = k_4d[c_id]
+                    v_sub = v_4d[c_id]
+                    if L_sub < k_sub.shape[0]:
+                        k_sub = k_sub[:L_sub]
+                        v_sub = v_sub[:L_sub]
+                    q_sub_2d = q_sub.movedim(0, 1)
+                    k_sub_2d = k_sub.movedim(0, 1)
+                    v_sub_2d = v_sub.movedim(0, 1)
+                    out_chunk_2d, attn_probs_ = forward_attn_chunk(q_sub_2d, k_sub_2d, v_sub_2d, softmax_scale, causal, is_training, dropout_p)
+                    attn_probs_steps[step_i] = attn_probs_
+                    step_saves[f"q_sub_{step_i}"] = q_sub
+                    step_saves[f"k_sub_{step_i}"] = k_sub
+                    step_saves[f"v_sub_{step_i}"] = v_sub
+                if step_i > 0:
+                    prev = step_i - 1
+                    pc_id = local_seq_chunk_ids[prev]
+                    ps = pc_id * chunk_len
+                    pe = ps + chunk_len
+                    ps_c = max(0, min(ps, local_len))
+                    pe_c = max(0, min(pe, local_len))
+                    l_out = pe_c - ps_c
+                    if l_out > 0:
+                        out_loc[ps_c:pe_c] = out_chunk_2d.movedim(1, 0)[:l_out]
+            return out_loc, gather_k, gather_v, step_saves, attn_probs_steps
 
-        for i in range(num_docs):
-            doc_start = boundaries[i]
-            doc_end = boundaries[i+1]
-            L_doc = doc_end - doc_start
+        # Process divisible portions.
+        for i in range(len(doc_lens)):
+            ds = boundaries[i]
+            de = boundaries[i+1]
+            L_i = de - ds
+            D_i, R_i = compute_divisible_and_leftover(L_i, cp_size)
+            if D_i > 0:
+                q_loc = q_2d[:, ds:ds+D_i, :].movedim(1, 0).contiguous()
+                k_loc = k_2d[:, ds:ds+D_i, :].movedim(1, 0).contiguous()
+                v_loc = v_2d[:, ds:ds+D_i, :].movedim(1, 0).contiguous()
+                out_loc, gk, gv, step_saves, attn_probs_steps = sym_chunk_fwd(q_loc, k_loc, v_loc)
+                out_loc_2d = out_loc.movedim(0, 1)
+                out_2d[:, ds:ds+D_i, :] += out_loc_2d
+                saved_divisible.append({
+                    'ds': ds,
+                    'D_i': D_i,
+                    'q_loc': q_loc,
+                    'gather_k': gk,
+                    'gather_v': gv,
+                    'step_saves': step_saves,
+                    'attn_probs': attn_probs_steps
+                })
 
-            bnds = balanced_boundaries(L_doc, N)
-            debug_log(f"[Doc {i}] L_doc: {L_doc}, balanced boundaries: {bnds}")
-
-            # compute effective indices for this rank
-            seg0 = (bnds[rank], bnds[rank+1])
-            seg1 = (bnds[N - rank - 1], bnds[N - rank])
-            debug_log(f"[Doc {i}] Rank {rank} effective seg0: {seg0}, seg1: {seg1}")
-
-            # determine if padding is needed
-            pad = 0
-            if L_doc % N != 0:
-                pad = N - (L_doc % N)
-                debug_log(f"[Doc {i}] Padding required: {pad} tokens")
-
-            # create padded tensors
-            doc_q_pad = torch.cat([q[:, doc_start:doc_end, :],
-                                   q.new_zeros(B, pad, D)], dim=1)
-            doc_k_pad = torch.cat([k[:, doc_start:doc_end, :],
-                                   k.new_zeros(B, pad, D)], dim=1)
-            doc_v_pad = torch.cat([v[:, doc_start:doc_end, :],
-                                   v.new_zeros(B, pad, D)], dim=1)
-            L_pad = L_doc + pad
-            L_chunk = L_pad // N
-            debug_log(f"[Doc {i}] L_pad: {L_pad}, L_chunk: {L_chunk}")
-
-            # store the padded tensors and boundaries
-            ctx.doc_padded.append({
-                'q': doc_q_pad,
-                'k': doc_k_pad,
-                'v': doc_v_pad,
-                'bnds': bnds,
-                'pad': pad,
-                'L_chunk': L_chunk
+        # Process leftover portions.
+        leftover_saves = []
+        for i in range(len(doc_lens)):
+            ds = boundaries[i]
+            de = boundaries[i+1]
+            L_i = de - ds
+            D_i, R_i = compute_divisible_and_leftover(L_i, cp_size)
+            if R_i == 0:
+                leftover_saves.append(None)
+                continue
+            st = ds + D_i
+            ed = de
+            R_len = ed - st
+            q_left = q_2d[:, st:ed, :].movedim(1, 0).contiguous()
+            k_left = k_2d[:, st:ed, :].movedim(1, 0).contiguous()
+            v_left = v_2d[:, st:ed, :].movedim(1, 0).contiguous()
+            N = 2 * cp_size
+            leftover_idx = []
+            for c in range(N):
+                leftover_idx += [j for j in range(R_len) if (j % N) == c]
+            leftover_idx_t = torch.tensor(leftover_idx, device=q.device, dtype=torch.long)
+            inv_idx_t = torch.empty_like(leftover_idx_t)
+            for pos, val in enumerate(leftover_idx):
+                inv_idx_t[val] = pos
+            q_left_rr = q_left.index_select(0, leftover_idx_t)
+            k_left_rr = k_left.index_select(0, leftover_idx_t)
+            v_left_rr = v_left.index_select(0, leftover_idx_t)
+            out_loc, gk, gv, step_saves, attn_probs_steps = sym_chunk_fwd(q_left_rr, k_left_rr, v_left_rr)
+            out_loc_inv = out_loc.index_select(0, inv_idx_t)
+            out_loc_2d = out_loc_inv.movedim(0, 1)
+            out_2d[:, st:ed, :] += out_loc_2d
+            leftover_saves.append({
+                'ds_left': st,
+                'R_len': R_len,
+                'q_left_rr': q_left_rr,
+                'gather_k': gk,
+                'gather_v': gv,
+                'left_idx': leftover_idx_t,
+                'inv_idx': inv_idx_t,
+                'step_saves': step_saves,
+                'attn_probs': attn_probs_steps
             })
-            ctx.shard_info.append({
-                'doc_start': doc_start,
-                'doc_end': doc_end,
-                'seg0': seg0,
-                'seg1': seg1,
-            })
 
-            # reshape padded tensors
-            doc_q_reshaped = doc_q_pad.view(B, N, L_chunk, D)
-            doc_k_reshaped = doc_k_pad.view(B, N, L_chunk, D)
-            doc_v_reshaped = doc_v_pad.view(B, N, L_chunk, D)
-            debug_log(f"[Doc {i}] doc_q_reshaped shape: {doc_q_reshaped.shape}")
-
-            # for this rank, select the two shards
-            idx0 = rank
-            idx1 = N - rank - 1
-            q_shard0 = doc_q_reshaped[:, idx0, :, :]
-            q_shard1 = doc_q_reshaped[:, idx1, :, :]
-            local_k0 = doc_k_reshaped[:, idx0, :, :]
-            local_v0 = doc_v_reshaped[:, idx0, :, :]
-            local_k1 = doc_k_reshaped[:, idx1, :, :]
-            local_v1 = doc_v_reshaped[:, idx1, :, :]
-
-            # compute effective lengths
-            eff_len0 = seg0[1] - seg0[0]
-            eff_len1 = seg1[1] - seg1[0]
-
-            # compute attention on each shard
-            def compute_attn(q_shard, k_full, v_full):
-                attn_scores = torch.matmul(q_shard, k_full.transpose(-2, -1)) * softmax_scale
-                if causal:
-                    B_, Lq = q_shard.shape[:2]
-                    L_full = k_full.size(1)
-                    key_idx = torch.arange(0, L_full, device=q.device).unsqueeze(0)
-                    query_idx = torch.arange(0, Lq, device=q.device).unsqueeze(1)
-                    mask = key_idx <= query_idx
-                    attn_scores.masked_fill_(~mask, float('-inf'))
-                attn_probs = torch.softmax(attn_scores, dim=-1)
-                if is_training and dropout_p > 0:
-                    attn_probs = torch.nn.functional.dropout(attn_probs, p=dropout_p, training=True)
-                out = torch.matmul(attn_probs, v_full)
-                return out, attn_probs
-
-            out_seg0, attn_probs0 = compute_attn(q_shard0, local_k0, local_v0)
-            out_seg1, attn_probs1 = compute_attn(q_shard1, local_k1, local_v1)
-            ctx.attn_probs.append((attn_probs0, attn_probs1))
-            debug_log(f"[Doc {i}] Shard0 out shape: {out_seg0.shape}, Shard1 out shape: {out_seg1.shape}")
-
-            # crop the outputs to the effective lengths
-            out0 = out_seg0[:, :eff_len0, :]
-            out1 = out_seg1[:, :eff_len1, :]
-            doc_out = q.new_zeros(B, L_doc, D)
-            doc_out[:, seg0[0]:seg0[1], :].copy_(out0)
-            doc_out[:, seg1[0]:seg1[1], :].copy_(out1)
-            output[:, doc_start:doc_end, :] = doc_out
-
-        dist.all_reduce(output, group=cp_group)
-        ctx.save_for_backward(q, k, v, torch.tensor(doc_lens, device=q.device, dtype=torch.int32))
+        ctx.saved_divisible = saved_divisible
+        ctx.saved_leftover = leftover_saves
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.attn_mask_type = attn_mask_type
+        ctx.attn_bias_type = attn_bias_type
         ctx.cp_group = cp_group
         ctx.cp_stream = cp_stream
-        ctx.softmax_scale = softmax_scale
-        ctx.dropout_p = dropout_p
-        ctx.input_shape = q.shape
-        nvtx_range_pop("AttnFuncWithCPAndPerDocKVAllGather.forward")
-        return output
+        ctx.orig_shape = q.shape  # [B, S, nHeads, headDim]
+        ctx.is_training = is_training
+
+        nvtx_range_pop("AttnFuncWithPerDocRoundRobinSharding.forward")
+        return out_2d
 
     @staticmethod
     def backward(ctx, dout):
-        nvtx_range_push("AttnFuncWithCPAndPerDocKVAllGather.backward")
-        q, k, v, doc_lens_tensor = ctx.saved_tensors[:4]
-        boundaries = ctx.boundaries
-        shard_info = ctx.shard_info
-        softmax_scale = ctx.softmax_scale
+        nvtx_range_push("AttnFuncWithPerDocRoundRobinSharding.backward")
+        B, S, nHeads, headDim = ctx.orig_shape
+        D = nHeads * headDim
+        dout_2d = dout.view(B, S, D)
+        dq_2d = torch.zeros_like(dout_2d)
+        dk_2d = torch.zeros_like(dout_2d)
+        dv_2d = torch.zeros_like(dout_2d)
+
+        cp_group = ctx.cp_group
+        rank = dist.get_rank(cp_group)
+        cp_size = dist.get_world_size(cp_group)
+        local_seq_chunk_ids = [rank, (2 * cp_size - rank - 1)]
         dropout_p = ctx.dropout_p
-        B, S, D = ctx.input_shape
-        num_docs = len(shard_info)
+        softmax_scale = ctx.softmax_scale
+        causal = ("causal" in ctx.attn_mask_type)
+        is_training = ctx.is_training
 
-        grad_q = torch.zeros_like(q)
-        grad_k = torch.zeros_like(k)
-        grad_v = torch.zeros_like(v)
+        def sym_chunk_bwd(dout_loc, q_loc, gather_k, gather_v, step_saves, attn_probs):
+            dq_loc = torch.zeros_like(q_loc)
+            dk_loc = torch.zeros_like(q_loc)
+            dv_loc = torch.zeros_like(q_loc)
+            local_len = q_loc.shape[0]
+            # If local_len is too small to split evenly, process whole.
+            if local_len < 2 * cp_size:
+                dQ_, dK_, dV_ = backward_attn_chunk(
+                    dout_loc.movedim(0, 1),
+                    attn_probs[0],
+                    q_loc.movedim(0, 1),
+                    gather_k.movedim(0, 1),
+                    gather_v.movedim(0, 1),
+                    softmax_scale,
+                )
+                dq_loc = dQ_.movedim(1, 0)
+                dk_loc = dK_.movedim(1, 0)
+                dv_loc = dV_.movedim(1, 0)
+                dk_ag = gather_along_first_dim(dk_loc, cp_group)
+                dv_ag = gather_along_first_dim(dv_loc, cp_group)
+                dk_rs = reduce_scatter_along_first_dim(dk_ag, cp_group)
+                dv_rs = reduce_scatter_along_first_dim(dv_ag, cp_group)
+                return dq_loc, dk_rs, dv_rs
 
-        def attention_backward(dout_shard, attn_probs, q_shard, local_k, local_v):
-            dV = torch.matmul(attn_probs.transpose(-2, -1), dout_shard)
-            dA = torch.matmul(dout_shard, local_v.transpose(-2, -1))
-            dScores = attn_probs * (dA - (dA * attn_probs).sum(dim=-1, keepdim=True)) * softmax_scale
-            dQ = torch.matmul(dScores, local_k)
-            dK = torch.matmul(dScores.transpose(-2, -1), q_shard)
-            return dQ, dK, dV
+            chunk_len = local_len // 2
+            for step_i in range(len(local_seq_chunk_ids) + 1):
+                if step_i < len(local_seq_chunk_ids):
+                    c_id = local_seq_chunk_ids[step_i]
+                    row_start = c_id * chunk_len
+                    row_end = row_start + chunk_len
+                    rs = max(0, min(row_start, local_len))
+                    re = max(0, min(row_end, local_len))
+                    L_sub = re - rs
+                    if L_sub <= 0:
+                        continue
+                    q_sub = step_saves[f"q_sub_{step_i}"]
+                    k_sub = step_saves[f"k_sub_{step_i}"]
+                    v_sub = step_saves[f"v_sub_{step_i}"]
+                    attn_probs_ = attn_probs[step_i]
+                    dout_sub = dout_loc[rs:re]
+                    if L_sub < k_sub.shape[0]:
+                        k_sub = k_sub[:L_sub]
+                        v_sub = v_sub[:L_sub]
+                    dout_sub_2d = dout_sub.movedim(0, 1)
+                    q_sub_2d = q_sub.movedim(0, 1)
+                    k_sub_2d = k_sub.movedim(0, 1)
+                    v_sub_2d = v_sub.movedim(0, 1)
+                    dQ_, dK_, dV_ = backward_attn_chunk(
+                        dout_sub_2d, attn_probs_, q_sub_2d, k_sub_2d, v_sub_2d, softmax_scale
+                    )
+                    dq_loc[rs:re] += dQ_.movedim(1, 0)
+                    dk_loc[rs:re] += dK_.movedim(1, 0)
+                    dv_loc[rs:re] += dV_.movedim(1, 0)
+            dk_ag = gather_along_first_dim(dk_loc, cp_group)
+            dv_ag = gather_along_first_dim(dv_loc, cp_group)
+            dk_rs = reduce_scatter_along_first_dim(dk_ag, cp_group)
+            dv_rs = reduce_scatter_along_first_dim(dv_ag, cp_group)
+            return dq_loc, dk_rs, dv_rs
 
-        for i in range(num_docs):
-            doc_start = boundaries[i]
-            doc_end = boundaries[i+1]
-            L_doc = doc_end - doc_start
+        for rec in ctx.saved_divisible:
+            ds = rec["ds"]
+            D_i = rec["D_i"]
+            q_loc = rec["q_loc"]
+            gk = rec["gather_k"]
+            gv = rec["gather_v"]
+            step_saves = rec["step_saves"]
+            attn_probs = rec["attn_probs"]
 
-            info = shard_info[i]
-            seg0 = info['seg0']
-            seg1 = info['seg1']
+            dout_loc = dout_2d[:, ds:ds+D_i, :].movedim(1, 0).contiguous()
+            dq_loc, dk_rs, dv_rs = sym_chunk_bwd(dout_loc, q_loc, gk, gv, step_saves, attn_probs)
+            dq_2d[:, ds:ds+D_i, :] += dq_loc.movedim(0, 1)
+            dk_2d[:, ds:ds+D_i, :] += dk_rs.movedim(0, 1)
+            dv_2d[:, ds:ds+D_i, :] += dv_rs.movedim(0, 1)
 
-            # retrieve stored padded tensors and info
-            padded = ctx.doc_padded[i]
-            doc_q_pad = padded['q']
-            doc_k_pad = padded['k']
-            doc_v_pad = padded['v']
-            L_pad = doc_q_pad.shape[1]
-            N = 2 * get_distributed_world_size(ctx.cp_group)
-            L_chunk = padded['L_chunk']
-            debug_log(f"[Backward Doc {i}] L_doc: {L_doc}, pad: {padded['pad']}, L_pad: {L_pad}, L_chunk: {L_chunk}")
+        for rec in ctx.saved_leftover:
+            if rec is None:
+                continue
+            ds_left = rec["ds_left"]
+            R_len = rec["R_len"]
+            q_left_rr = rec["q_left_rr"]
+            gk = rec["gather_k"]
+            gv = rec["gather_v"]
+            leftover_idx = rec["left_idx"]
+            inv_idx = rec["inv_idx"]
+            step_saves = rec["step_saves"]
+            attn_probs = rec["attn_probs"]
 
-            # reshape stored padded tensors
-            doc_q_reshaped = doc_q_pad.view(B, N, L_chunk, D)
-            doc_k_reshaped = doc_k_pad.view(B, N, L_chunk, D)
-            doc_v_reshaped = doc_v_pad.view(B, N, L_chunk, D)
-            debug_log(f"[Backward Doc {i}] doc_q_reshaped shape: {doc_q_reshaped.shape}")
+            dout_loc = dout_2d[:, ds_left:ds_left+R_len, :].movedim(1, 0).contiguous()
+            dout_rr = dout_loc.index_select(0, leftover_idx)
+            dq_loc, dk_rs, dv_rs = sym_chunk_bwd(dout_rr, q_left_rr, gk, gv, step_saves, attn_probs)
+            dq_loc_inv = dq_loc.index_select(0, inv_idx)
+            dq_2d[:, ds_left:ds_left+R_len, :] += dq_loc_inv.movedim(0, 1)
+            dk_inv = dk_rs.index_select(0, inv_idx)
+            dv_inv = dv_rs.index_select(0, inv_idx)
+            dk_2d[:, ds_left:ds_left+R_len, :] += dk_inv.movedim(0, 1)
+            dv_2d[:, ds_left:ds_left+R_len, :] += dv_inv.movedim(0, 1)
 
-            rank_local = get_distributed_rank(ctx.cp_group)
-            idx0 = rank_local
-            idx1 = N - rank_local - 1
+        dq = dq_2d.view(B, S, nHeads, headDim)
+        dk = dk_2d.view(B, S, nHeads, headDim)
+        dv = dv_2d.view(B, S, nHeads, headDim)
 
-            eff_len0 = seg0[1] - seg0[0]
-            eff_len1 = seg1[1] - seg1[0]
-
-            q_shard0 = doc_q_reshaped[:, idx0, :eff_len0, :].view(B, -1, D)
-            q_shard1 = doc_q_reshaped[:, idx1, :eff_len1, :].view(B, -1, D)
-            local_k0 = doc_k_reshaped[:, idx0, :eff_len0, :]
-            local_v0 = doc_v_reshaped[:, idx0, :eff_len0, :]
-            local_k1 = doc_k_reshaped[:, idx1, :eff_len1, :]
-            local_v1 = doc_v_reshaped[:, idx1, :eff_len1, :]
-
-            dout_doc = dout[:, doc_start:doc_end, :]
-            if L_doc < L_pad:
-                dout_doc_pad = torch.cat([dout_doc, dout_doc.new_zeros(B, L_pad - L_doc, D)], dim=1)
-            else:
-                dout_doc_pad = dout_doc
-            dout_reshaped = dout_doc_pad.view(B, N, L_chunk, D)
-            dout_seg0 = dout_reshaped[:, idx0, :eff_len0, :]
-            dout_seg1 = dout_reshaped[:, idx1, :eff_len1, :]
-
-            # retrieve saved attention probabilities and crop them
-            saved_attn_probs0, saved_attn_probs1 = ctx.attn_probs[i]
-            saved_attn_probs0 = saved_attn_probs0[:, :eff_len0, :eff_len0]
-            saved_attn_probs1 = saved_attn_probs1[:, :eff_len1, :eff_len1]
-
-            dQ0, dK0, dV0 = attention_backward(dout_seg0, saved_attn_probs0, q_shard0, local_k0, local_v0)
-            dQ1, dK1, dV1 = attention_backward(dout_seg1, saved_attn_probs1, q_shard1, local_k1, local_v1)
-
-            grad_q[:, doc_start+seg0[0]:doc_start+seg0[1], :].copy_(dQ0)
-            grad_q[:, doc_start+seg1[0]:doc_start+seg1[1], :].copy_(dQ1)
-            grad_k[:, doc_start+seg0[0]:doc_start+seg0[1], :].add_(dK0)
-            grad_k[:, doc_start+seg1[0]:doc_start+seg1[1], :].add_(dK1)
-            grad_v[:, doc_start+seg0[0]:doc_start+seg0[1], :].add_(dV0)
-            grad_v[:, doc_start+seg1[0]:doc_start+seg1[1], :].add_(dV1)
-
-            debug_log(f"[Backward Doc {i}] dQ0 shape: {dQ0.shape}, dQ1 shape: {dQ1.shape}")
-            debug_log(f"[Backward Doc {i}] dK0 shape: {dK0.shape}, dK1 shape: {dK1.shape}")
-
-        dist.all_reduce(grad_q, group=ctx.cp_group)
-        dist.all_reduce(grad_k, group=ctx.cp_group)
-        dist.all_reduce(grad_v, group=ctx.cp_group)
-        grad_q = grad_q.view(ctx.orig_shape)
-        grad_k = grad_k.view(ctx.orig_shape)
-        grad_v = grad_v.view(ctx.orig_shape)
-        nvtx_range_pop("AttnFuncWithCPAndPerDocKVAllGather.backward")
-        return (None, grad_q, grad_k, grad_v, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+        nvtx_range_pop("AttnFuncWithPerDocRoundRobinSharding.backward")
+        return (None, dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
 
