@@ -92,10 +92,11 @@ def run(rank, world_size, doc_lens):
         s0, e0, s1, e1 = compute_expected_shard_boundaries(l, cp_size, rank)
         print(f" Document {i}: length={l}, seg0: [{s0}, {e0}), seg1: [{s1}, {e1})")
 
-    # create identical random inputs (bshd layout)
-    q_seq = torch.randn((1, CONTEXT_LENGTH, NUM_HEADS, HEAD_DIM), device=device, dtype=torch.float16, requires_grad=True)
-    k_seq = torch.randn((1, CONTEXT_LENGTH, NUM_HEADS, HEAD_DIM), device=device, dtype=torch.float16, requires_grad=True)
-    v_seq = torch.randn((1, CONTEXT_LENGTH, NUM_HEADS, HEAD_DIM), device=device, dtype=torch.float16, requires_grad=True)
+    # Create identical random inputs in bshd layout.
+    # Force values to be in the range (-0.5, +0.5) by using torch.rand and shifting.
+    q_seq = (torch.rand((1, CONTEXT_LENGTH, NUM_HEADS, HEAD_DIM), device=device, dtype=torch.bfloat16) - 0.5).requires_grad_()
+    k_seq = (torch.rand((1, CONTEXT_LENGTH, NUM_HEADS, HEAD_DIM), device=device, dtype=torch.bfloat16) - 0.5).requires_grad_()
+    v_seq = (torch.rand((1, CONTEXT_LENGTH, NUM_HEADS, HEAD_DIM), device=device, dtype=torch.bfloat16) - 0.5).requires_grad_()
     q_doc = q_seq.clone().detach().requires_grad_()
     k_doc = k_seq.clone().detach().requires_grad_()
     v_doc = v_seq.clone().detach().requires_grad_()
