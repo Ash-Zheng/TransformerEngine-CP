@@ -19,17 +19,7 @@ from transformer_engine.pytorch.utils import (
 
 class AttnFuncWithAllGatherPerDocSharding(Function):
     """
-    Per-document CP attention forward pass *fixed* so that each rank extracts
-    the correct slice of k_global/v_global from the all-gather. This ensures
-    rank=0 picks [0..T_local-1], rank=1 picks [T_local..2*T_local-1], etc.
-    
-    We assume:
-      1) doc_lens is already local doc lengths (e.g. [4,8] if global was [8,16] and cp_size=2),
-      2) the local q is shape [B, T_local, nHeads, headDim],
-      3) cp_size = # of ranks,
-      4) local q is formed by “front+back” chunks from each doc, and we want
-         to do 2 varlen forward calls (one for front shards, one for back),
-         then reassemble them in the original local order.
+    Per-document CP attention.
     """
 
     @staticmethod
@@ -102,7 +92,7 @@ class AttnFuncWithAllGatherPerDocSharding(Function):
         # 4) Each rank's slice in k_ag, v_ag is from rank*T_local .. (rank+1)*T_local -1
         offset_for_rank = rank * T_local
 
-        # We'll build the same doc-based front/back shards from k_global, v_global,
+        # build the same doc-based front/back shards from k_global, v_global,
         # but each doc is within [offset_for_rank .. offset_for_rank+L_local].
         global_front_k = []
         global_back_k  = []
@@ -167,7 +157,7 @@ class AttnFuncWithAllGatherPerDocSharding(Function):
         out_front_4d = out_front_2d.view(s_front, B, nHeads, headDim).transpose(0,1).contiguous()  # => [B, s_front, nHeads, headDim]
         out_back_4d  = out_back_2d.view(s_back,  B, nHeads, headDim).transpose(0,1).contiguous()
 
-        # 6) Reassemble doc by doc in correct order: front followed by back
+        # 6) Reassemble doc by doc in order: front followed by back
         #   so total => [B, T_local, nHeads, headDim]
         outputs = []
         front_idx = 0
@@ -184,3 +174,8 @@ class AttnFuncWithAllGatherPerDocSharding(Function):
 
         nvtx_range_pop("AttnFuncWithAllGatherPerDocSharding.forward")
         return out.to(torch.bfloat16)
+    
+    @staticmethod
+    def backward():
+        # TODO: implement the backwards pass
+        return None
