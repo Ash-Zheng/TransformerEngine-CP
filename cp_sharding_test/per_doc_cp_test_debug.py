@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 import sys
 import os
-import random
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -11,213 +10,200 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from transformer_engine.pytorch.attention import AttnFuncWithCPAndKVAllGather
-from per_document_cp_sharding.per_document_cp_sharding import AttnFuncWithPerDocRoundRobinSharding
-from transformer_engine.pytorch.distributed import get_distributed_world_size, get_distributed_rank
-from transformer_engine.pytorch.utils import nvtx_range_push, nvtx_range_pop
+from per_document_cp_sharding.per_document_cp_sharding import AttnFuncWithAllGatherPerDocSharding
 
-# global parameters
-CONTEXT_LENGTH = 128 * 1024  # 128k tokens
-NUM_HEADS = 8
-HEAD_DIM = 64              # must be a multiple of 8
-D = NUM_HEADS * HEAD_DIM   # merged token dimension
+def generate_global_tokens():
+    """
+    Generate a global token sequence for a context window of 24 tokens,
+    consisting of 2 documents:
+      - Document 1: tokens 0-6 are regular tokens; token 7 is <eos> (-1)
+      - Document 2: tokens 8-22 are regular tokens; token 23 is <eos> (-1)
+    Returns a tensor of shape [B, 24] with B = 1.
+    """
+    global_tokens = []
+    for i in range(7):
+        global_tokens.append(i)
+    global_tokens.append(-1)  # <eos> for doc1
+    for i in range(8, 23):
+        global_tokens.append(i)
+    global_tokens.append(-1)  # <eos> for doc2
+    assert len(global_tokens) == 24, f"Expected 24 tokens, got {len(global_tokens)}"
+    return torch.tensor([global_tokens], dtype=torch.int64)
 
-def print_tensor_stats(tensor, name):
-    tensor = tensor.float()  # ensure float for printing stats
-    print(f"{name}: mean={tensor.mean().item():.4f}, std={tensor.std().item():.4f}, min={tensor.min().item():.4f}, max={tensor.max().item():.4f}")
+def embed_tokens(tokens):
+    """
+    Embeds tokens into vectors of size 8.
+    For demonstration, each non-<eos> token is mapped to a vector of size 8 with all entries equal
+    to the token id (as float), and <eos> tokens (represented as -1) remain as -1.
+    The output shape is [B, T, 1, 8] and is converted to bfloat16.
+    """
+    B, T = tokens.shape
+    emb = tokens.float().unsqueeze(-1).unsqueeze(-1).expand(B, T, 1, 8)
+    return emb.to(torch.bfloat16)
 
-def print_stats(ref, test, boundaries, tensor_name="Output"):
-    for i in range(len(boundaries)-1):
-        start = boundaries[i]
-        end = boundaries[i+1]
-        ref_slice = ref[:, start:end, :]
-        test_slice = test[:, start:end, :]
-        diff = (ref_slice - test_slice).abs()
-        print(f"Document {i} (tokens {start}-{end}, length={end-start}):")
-        print(f"  {tensor_name} diff: mean={diff.mean().item():.4f}, std={diff.std().item():.4f}, min={diff.min().item():.4f}, max={diff.max().item():.4f}")
-        print("  Ref stats:")
-        print_tensor_stats(ref_slice, "    ")
-        print("  Test stats:")
-        print_tensor_stats(test_slice, "    ")
+def global_to_local(global_tokens, global_doc_lens, rank, cp_size):
+    """
+    Maps a global token tensor (shape [B, 24]) to local tokens for a given CP rank.
+    For cp_size=2 (num_chunks=4), each document is split into 4 chunks.
+    For each document:
+      - For rank 0: local tokens = concatenation of chunk0 and chunk3.
+      - For rank 1: local tokens = concatenation of chunk1 and chunk2.
+    Returns a tensor of shape [B, T_local].
+    """
+    B, T = global_tokens.shape
+    num_chunks = 2 * cp_size  # 4
+    local_tokens_list = []
+    for b in range(B):
+        tokens = global_tokens[b]
+        local_doc_list = []
+        start = 0
+        for L in global_doc_lens[b]:
+            doc = tokens[start:start+L]
+            base = L // num_chunks
+            rem = L % num_chunks
+            # For simplicity assume rem==0.
+            chunks = [doc[j*base:(j+1)*base] for j in range(num_chunks)]
+            if rank == 0:
+                local_doc = torch.cat([chunks[0], chunks[3]], dim=0)
+            else:
+                local_doc = torch.cat([chunks[1], chunks[2]], dim=0)
+            local_doc_list.append(local_doc)
+            start += L
+        local_tokens_list.append(torch.cat(local_doc_list, dim=0).unsqueeze(0))
+    return torch.cat(local_tokens_list, dim=0)
 
-def get_single_document():
-    # return a single document spanning the full context length.
-    return [CONTEXT_LENGTH]
+def compute_local_doc_lens(global_doc_lens, cp_size, rank):
+    """
+    Given global doc lengths (e.g. [8,16]), compute local doc lengths for a given CP rank.
+    For cp_size=2, each document's local length = global_length // 2.
+    """
+    return [L // 2 for L in global_doc_lens]
 
-def get_eight_documents():
-    # generate 8 random document lengths that sum to CONTEXT_LENGTH.
-    # sample 7 random breakpoints within [1, CONTEXT_LENGTH-1]
-    # then compute the differences.
-    pts = sorted(random.sample(range(1, CONTEXT_LENGTH), 7))
-    docs = [pts[0]] + [pts[i] - pts[i-1] for i in range(1, len(pts))] + [CONTEXT_LENGTH - pts[-1]]
-    # to reduce variability in logging, print the document lengths.
-    print("Eight document lengths:", docs)
-    return docs
-
-def run(rank, world_size, doc_lens):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    torch.cuda.set_device(rank)
-    device = torch.device("cuda", rank)
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    cp_group = dist.new_group(ranks=list(range(world_size)))
-    cp_stream = torch.cuda.Stream(device=device)
-
-    total_tokens = sum(doc_lens)
-    assert total_tokens == CONTEXT_LENGTH, f"Total tokens {total_tokens} != {CONTEXT_LENGTH}"
-
-    # compute document boundaries based on doc_lens.
+def map_local_to_global(doc_lens, gathered_outputs):
+    """
+    Reassemble the global output from gathered local outputs.
+    
+    Args:
+      doc_lens: a list of global document lengths [L0, L1, ..., L_{D-1}] for B=1.
+                Each Ld is assumed divisible by (2*cp_size).  
+      gathered_outputs: a list of length R (the cp world size), where 
+          gathered_outputs[r] is rank r's local output tensor of shape 
+          [1, local_sum, nHeads, headDim], with 
+          local_sum = sum_d (Ld // cp_size).
+    
+    For each document d, the local token count per worker is:
+         local_doc_len = Ld // cp_size.
+    Each worker’s local output for document d is assumed to be the concatenation of two shards,
+    each of length shard_len = Ld // (2*cp_size).
+    
+    The desired global token order for document d is:
+         F[0], F[1], …, F[R-1], B[R-1], B[R-2], …, B[0],
+    where for each worker r:
+         F[r] = first half of worker r’s local output for doc d,
+         B[r] = second half of worker r’s local output for doc d.
+    
+    The function processes each document in order and concatenates the results,
+    returning a tensor of shape [1, sum(Ld), nHeads, headDim] that has the tokens in the correct global order.
+    
+    Note: This implementation assumes B = 1.
+    """
+    cp_size = len(gathered_outputs)  # Number of CP workers (R)
+    
+    # Compute cumulative boundaries for each document in each worker's local output.
+    # Each document d has local length = Ld_local = Ld // cp_size.
     boundaries = [0]
-    for l in doc_lens:
-        boundaries.append(boundaries[-1] + l)
-    print(f"[Rank {rank}] Document boundaries: {boundaries}")
+    for L in doc_lens:
+        boundaries.append(boundaries[-1] + (L // (2 * cp_size)) * 2)  
+        # Because each doc is split into 2 shards per worker, so total tokens per doc per worker is Ld//cp_size.
+    
+    # Now, for each document, we reassemble from each worker.
+    reassembled_docs = []
+    # For each document d, local tokens per worker = Ld_local = Ld // cp_size.
+    # And each shard length = shard_len = Ld // (2 * cp_size).
+    for d in range(len(doc_lens)):
+        shard_len = doc_lens[d] // (2 * cp_size)
+        # For each CP worker r, extract its portion for document d from gathered_outputs[r].
+        # The local output for document d in worker r is at positions:
+        #   start = boundaries[d], end = boundaries[d+1] (same for all workers)
+        doc_shards = []  # List of tensors from each worker, but each worker provides two shards.
+        for r in range(cp_size):
+            # gathered_outputs[r] is shape [1, total_local, nHeads, headDim]
+            local_doc = gathered_outputs[r][0, boundaries[d]:boundaries[d+1], :, :]  # shape [Ld_local, nHeads, headDim]
+            # Split into front and back halves.
+            front = local_doc[:shard_len, :, :]
+            back  = local_doc[shard_len:, :, :]
+            doc_shards.append((front, back))
+        # Now reassemble document d in the following order:
+        #   first, all front shards in order r = 0...R-1,
+        #   then all back shards in reverse order r = R-1...0.
+        front_parts = [doc_shards[r][0] for r in range(cp_size)]
+        back_parts  = [doc_shards[r][1] for r in reversed(range(cp_size))]
+        doc_global = torch.cat(front_parts + back_parts, dim=0)  # shape [Ld_local * cp_size = Ld, nHeads, headDim]
+        reassembled_docs.append(doc_global)
+    # Finally, concatenate all document outputs.
+    global_out = torch.cat(reassembled_docs, dim=0).unsqueeze(0)  # shape [1, sum(Ld), nHeads, headDim]
+    return global_out
 
-    # print expected shard boundaries for each document.
-    def compute_expected_shard_boundaries(doc_len, cp_size, rank):
-        N = 2 * cp_size
-        seg_len_base = doc_len // N
-        rem = doc_len % N
-        extra0 = 1 if rank < rem else 0
-        seg0_start = rank * seg_len_base + min(rank, rem)
-        seg0_end = seg0_start + seg_len_base + extra0
-        r2 = N - rank - 1
-        extra1 = 1 if r2 < rem else 0
-        seg1_start = r2 * seg_len_base + min(r2, rem)
-        seg1_end = seg1_start + seg_len_base + extra1
-        return seg0_start, seg0_end, seg1_start, seg1_end
 
-    cp_size = world_size  # for testing
-    print(f"[Rank {rank}] Expected shard boundaries per document:")
-    for i, l in enumerate(doc_lens):
-        s0, e0, s1, e1 = compute_expected_shard_boundaries(l, cp_size, rank)
-        print(f" Document {i}: length={l}, seg0: [{s0}, {e0}), seg1: [{s1}, {e1})")
-
-    # Create identical random inputs in bshd layout.
-    # Force values to be in the range (-0.5, +0.5) by using torch.rand and shifting.
-    q_seq = (torch.rand((1, CONTEXT_LENGTH, NUM_HEADS, HEAD_DIM), device=device, dtype=torch.bfloat16) - 0.5).requires_grad_()
-    k_seq = (torch.rand((1, CONTEXT_LENGTH, NUM_HEADS, HEAD_DIM), device=device, dtype=torch.bfloat16) - 0.5).requires_grad_()
-    v_seq = (torch.rand((1, CONTEXT_LENGTH, NUM_HEADS, HEAD_DIM), device=device, dtype=torch.bfloat16) - 0.5).requires_grad_()
-    q_doc = q_seq.clone().detach().requires_grad_()
-    k_doc = k_seq.clone().detach().requires_grad_()
-    v_doc = v_seq.clone().detach().requires_grad_()
-
-    # common parameters
-    is_training = True
-    dropout_p = 0.0
-    softmax_scale = None
-    qkv_format = "bshd"
-    attn_mask_type = "causal"
-    attn_bias_type = "no_bias"
-    attn_bias = None
-    deterministic = False
-    use_fused_attention = False
-    window_size = (128, 128)
-    cu_seqlens_q = torch.tensor([0, CONTEXT_LENGTH], device=device, dtype=torch.int32)
-    cu_seqlens_q_padded = cu_seqlens_q.clone()
-
-    # run per-sequence CP sharding
-    out_seq = AttnFuncWithCPAndKVAllGather.apply(
-        is_training,
-        q_seq,
-        k_seq,
-        v_seq,
-        cu_seqlens_q,
-        CONTEXT_LENGTH,
-        CONTEXT_LENGTH,
-        cu_seqlens_q_padded,
-        dropout_p,
-        softmax_scale,
-        qkv_format,
-        attn_mask_type,
-        attn_bias_type,
-        attn_bias,
-        deterministic,
-        use_fused_attention,
-        window_size,
+def run(rank, world_size):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    torch.cuda.set_device(rank)
+    
+    # Initialize NCCL distributed process group.
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    cp_group = dist.new_group(ranks=list(range(world_size)))
+    
+    global_doc_lens = [8, 16]
+    global_tokens = generate_global_tokens()  # shape [1, 24]
+    global_tokens = global_tokens.cuda()
+    print(f"[Rank {rank}] Global tokens:\n{global_tokens}")
+    
+    # Compute local tokens.
+    local_tokens = global_to_local(global_tokens, [global_doc_lens], rank, world_size)
+    print(f"[Rank {rank}] Local tokens (after sharding, shape {local_tokens.shape}):\n{local_tokens}")
+    
+    # Compute local document lengths.
+    local_doc_lens = compute_local_doc_lens(global_doc_lens, world_size, rank)
+    print(f"[Rank {rank}] Local document lengths: {local_doc_lens}")
+    
+    # Embed local tokens.
+    q = embed_tokens(local_tokens)  # shape [B, T_local, 1, 8]
+    k = q.clone()
+    v = q.clone()
+    print(f"[Rank {rank}] Local token embeddings (squeezed to [B, T_local, 8]):\n{q.squeeze(2)}")
+    
+    # Call the per-document forward pass (always in local mode).
+    local_doc_lens_nested = [local_doc_lens]  # e.g. [[4,8]]
+    local_out = AttnFuncWithAllGatherPerDocSharding.apply(
+        True,         # is_training
+        q,            # [B, T_local, 1, 8] (local tokens)
+        k,            # k tensor
+        v,            # v tensor
+        local_doc_lens_nested,     # local document lengths
+        0.0,          # dropout_p
+        None,         # softmax_scale
+        "bshd",       # qkv_format placeholder
+        "causal",     # attn_mask_type
+        "no_bias",    # attn_bias_type
+        None,         # attn_bias
+        False,        # deterministic
+        False,        # use_fused_attention (using varlen kernel)
+        (0, 0),       # window_size tuple
         cp_group,
-        cp_stream
+        torch.cuda.current_stream()
     )
-    # reshape to [1, CONTEXT_LENGTH, D]
-    out_seq = out_seq.view(1, CONTEXT_LENGTH, D)
-
-    # run per-document CP sharding
-    out_doc = AttnFuncWithPerDocRoundRobinSharding.apply(
-        is_training,
-        q_doc,
-        k_doc,
-        v_doc,
-        doc_lens,
-        dropout_p,
-        softmax_scale,
-        qkv_format,
-        attn_mask_type,
-        attn_bias_type,
-        attn_bias,
-        deterministic,
-        use_fused_attention,
-        window_size,
-        cp_group,
-        cp_stream
-    )
-    # out_doc is expected to be [1, CONTEXT_LENGTH, D]
-
-    torch.cuda.synchronize(device)
-
-    # intermediate logging: print overall output tensor statistics
-    print(f"[Rank {rank}] Per-sequence output stats:")
-    print_tensor_stats(out_seq.float(), "  ")
-    print(f"[Rank {rank}] Per-document output stats:")
-    print_tensor_stats(out_doc.float(), "  ")
-
-    full_diff = (out_seq.float() - out_doc.float()).abs().max().item()
-    print(f"[Rank {rank}] Full output max diff = {full_diff:.4f}")
-    if full_diff > 1e-2:
-        print(f"[Rank {rank}] Full outputs differ!")
-    else:
-        print(f"[Rank {rank}] Full outputs match.")
-
-    # log per-document differences
-    print("\nPer-document output differences:")
-    print_stats(out_seq.float(), out_doc.float(), boundaries, tensor_name="Output")
-
-    # backward pass
-    loss_seq = out_seq.sum()
-    loss_seq.backward()
-    grad_q_seq = q_seq.grad.clone()
-
-    loss_doc = out_doc.sum()
-    loss_doc.backward()
-    grad_q_doc = q_doc.grad.clone()
-
-    print("\nGradient statistics for q (per-sequence):")
-    print_tensor_stats(grad_q_seq.view(1, CONTEXT_LENGTH, D).float(), "  ")
-    print("\nGradient statistics for q (per-document):")
-    print_tensor_stats(grad_q_doc.view(1, CONTEXT_LENGTH, D).float(), "  ")
-
-    full_grad_diff = (grad_q_seq.view(1, CONTEXT_LENGTH, D).float() - grad_q_doc.view(1, CONTEXT_LENGTH, D).float()).abs().max().item()
-    print(f"[Rank {rank}] Full q grad max diff = {full_grad_diff:.4f}")
-    if full_grad_diff > 1e-2:
-        print(f"[Rank {rank}] Full q gradients differ!")
-    else:
-        print(f"[Rank {rank}] Full q gradients match.")
-
-    print("\nPer-document q grad differences:")
-    print_stats(grad_q_seq.view(1, CONTEXT_LENGTH, D).float(), grad_q_doc.view(1, CONTEXT_LENGTH, D).float(), boundaries, tensor_name="q grad")
-
+    print(f"[Rank {rank}] Local output from per-document forward pass (shape: {local_out.shape}):\n{local_out}")
+    
+    # Gather outputs from all CP workers.
+    gathered = [torch.empty_like(local_out) for _ in range(world_size)]
+    dist.all_gather(gathered, local_out)
+    if rank == 0:
+        global_out = map_local_to_global(global_doc_lens, gathered)
+        print(f"[Rank {rank}] Global output (reassembled, shape {global_out.shape}):\n{global_out.squeeze(2)}")
+    
     dist.destroy_process_group()
 
 if __name__ == "__main__":
-    # select test case via command-line argument: "single" or "multiple"
-    test_case = sys.argv[1] if len(sys.argv) > 1 else "single"
-    if test_case == "single":
-        print("Running single-document test case.")
-        doc_lens = get_single_document()
-    elif test_case == "multiple":
-        print("Running multiple-document test case (8 documents).")
-        doc_lens = get_eight_documents()
-    else:
-        print("Unknown test case. Use 'single' or 'multiple'.")
-        sys.exit(1)
-
     world_size = 2
-    mp.spawn(run, args=(world_size, doc_lens), nprocs=world_size)
+    mp.spawn(run, args=(world_size,), nprocs=world_size, join=True)

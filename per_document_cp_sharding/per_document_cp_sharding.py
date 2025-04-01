@@ -1,56 +1,45 @@
 import torch
-from torch.autograd import Function
 import torch.distributed as dist
+from torch.autograd import Function
+
+try:
+    from flash_attn.flash_attn_interface import _flash_attn_varlen_forward as fa_varlen_fwd
+except ImportError:
+    fa_varlen_fwd = None
 
 from transformer_engine.pytorch.distributed import (
     gather_along_first_dim,
-    reduce_scatter_along_first_dim,
+    get_distributed_world_size,
+    get_distributed_rank,
 )
-from flash_attn.flash_attn_interface import (
-    _flash_attn_varlen_forward as fa_varlen_fwd,
-    _flash_attn_varlen_backward as fa_varlen_bwd,
+from transformer_engine.pytorch.utils import (
+    nvtx_range_push,
+    nvtx_range_pop,
 )
 
-def compute_equal_chunks(total_tokens, cp_size):
+class AttnFuncWithAllGatherPerDocSharding(Function):
     """
-    Divide total_tokens into 2*cp_size contiguous segments.
-    Each segment gets a base length of total_tokens // (2*cp_size) tokens,
-    with any remaining tokens distributed such that no segment differs by more than one token.
-    Returns a list of tuples (start_offset, chunk_size) for each of the 2*cp_size segments.
-    """
-    N = 2 * cp_size
-    base_len = total_tokens // N
-    leftover = total_tokens % N
-    chunk_sizes = [base_len + (1 if i < leftover else 0) for i in range(N)]
-    chunk_ranges = []
-    offset = 0
-    for c_id in range(N):
-        c_size = chunk_sizes[c_id]
-        chunk_ranges.append((offset, c_size))
-        offset += c_size
-    return chunk_ranges
-
-class AttnFuncWithPerDocRoundRobinSharding(Function):
-    """
-    Implements per-document CP sharding using exactly two variable-length attention calls per rank.
-    The process is as follows:
-      1) merge document lengths to get the total token count T.
-      2) split the range [0, T) into 2*cp_size contiguous segments
-      3) each rank processes two segments: one at index equal to its rank and one at index (N - rank - 1)
-      4) extract the corresponding sub-range from the query tensor and perform a variable-length forward call,
-         yielding an output of shape [chunk_size, nHeads, headDim]
-      5) use partial indexing on the gathered key tensor (of shape [cp_size*T, B, nHeads, headDim])
-      6) in total, exactly two forward calls are executed per rank
+    Per-document CP attention forward pass *fixed* so that each rank extracts
+    the correct slice of k_global/v_global from the all-gather. This ensures
+    rank=0 picks [0..T_local-1], rank=1 picks [T_local..2*T_local-1], etc.
+    
+    We assume:
+      1) doc_lens is already local doc lengths (e.g. [4,8] if global was [8,16] and cp_size=2),
+      2) the local q is shape [B, T_local, nHeads, headDim],
+      3) cp_size = # of ranks,
+      4) local q is formed by “front+back” chunks from each doc, and we want
+         to do 2 varlen forward calls (one for front shards, one for back),
+         then reassemble them in the original local order.
     """
 
     @staticmethod
     def forward(
         ctx,
         is_training,
-        q,        # shape: [B, T, nHeads, headDim], where T = sum(doc_lens)
+        q,            # [B, T_local, nHeads, headDim] local Q
         k,
         v,
-        doc_lens,
+        doc_lens,     # e.g. [[4,8]] if B=1
         dropout_p,
         softmax_scale,
         qkv_format,
@@ -59,194 +48,139 @@ class AttnFuncWithPerDocRoundRobinSharding(Function):
         attn_bias,
         deterministic,
         use_fused_attention,
-        window_size,
+        window_size,   # (window_left, window_right)
         cp_group,
         cp_stream,
     ):
-        B, T, nHeads, headDim = q.shape
-        cp_size = dist.get_world_size(cp_group)
-        rank    = dist.get_rank(cp_group)
-        N       = 2 * cp_size
+        nvtx_range_push("AttnFuncWithAllGatherPerDocSharding.forward")
+        cp_size = get_distributed_world_size(cp_group)
+        rank = get_distributed_rank(cp_group)
 
-        # compute the chunk ranges for the 2*cp_size segments.
-        total_tokens = T
-        chunk_ranges = compute_equal_chunks(total_tokens, cp_size)
+        qkv_dtype = q.dtype
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** -0.5
+        causal = ("causal" in attn_mask_type)
+        assert "padding" not in attn_mask_type, f"{attn_mask_type} not supported!"
+        assert attn_bias_type == "no_bias", f"{attn_bias_type} not supported!"
 
-        # determine the two chunk indices that this rank will process
-        local_chunk_ids = [rank, (N - rank - 1)]
+        B, T_local, nHeads, headDim = q.shape
+        # e.g. if global doc lengths were [8,16] and cp_size=2 => local doc_lens = [4,8].
+        # We'll compute front/back shards for each doc in doc_lens[0].
 
-        # rearrange and gather the key (K) and value (V) tensors.
-        # k_local and v_local are reshaped to have the token dimension first
-        k_local = k.movedim(1, 0)  # shape becomes [T, B, nHeads, headDim]
-        v_local = v.movedim(1, 0)
-        k_ag, _ = gather_along_first_dim(k_local, cp_group)  # resulting shape: [cp_size*T, B, nHeads, headDim]
-        v_ag, _ = gather_along_first_dim(v_local, cp_group)
+        # 1) All-Gather local K, V => shape [cp_size*T_local, B, nHeads, headDim]
+        k_4d = k.movedim(1, 0).contiguous()  # => [T_local, B, nHeads, headDim]
+        v_4d = v.movedim(1, 0).contiguous()
+        k_ag, _ = gather_along_first_dim(k_4d, cp_group)  # => [cp_size*T_local, B, nHeads, headDim]
+        v_ag, _ = gather_along_first_dim(v_4d, cp_group)
 
-        # perform two forward calls using the chunk indices specified in local_chunk_ids
-        out_4d = torch.zeros_like(q)  # initialize output tensor with shape [B, T, nHeads, headDim]
-        causal_bool = ("causal" in attn_mask_type)
+        # 2) Flatten local Q => we'll eventually do 2 calls (front/back).
+        # But first we need to define front_size/back_size for each doc.
+        local_front_sizes = []
+        local_back_sizes  = []
+        for L_local in doc_lens[0]:
+            base = L_local // 2
+            rem  = L_local % 2
+            front_size = base + (1 if rank < rem else 0)
+            back_size  = base + (1 if (1 - rank) < rem else 0)
+            local_front_sizes.append(front_size)
+            local_back_sizes.append(back_size)
 
-        # Save necessary data for the backward pass
-        fwd_data = {}
-        for c_id in local_chunk_ids:
-            c_start, c_size = chunk_ranges[c_id]
-            if c_size == 0:
-                fwd_data[c_id] = None
-                continue
-            # extract the sub-range from the query tensor corresponding to this chunk (assumes B = 1)
-            q_chunk = q[0, c_start : c_start + c_size]  # resulting shape: [c_size, nHeads, headDim]
-            # create a cumulative sequence lengths tensor for the query sub-range: [0, c_size]
-            cu_q = torch.tensor([0, c_size], device=q.device, dtype=torch.int32)
+        s_front = sum(local_front_sizes)
+        s_back  = sum(local_back_sizes)
 
-            # extract the corresponding sub-range from the gathered key and value tensors.
-            k_chunk = k_ag[c_start : c_start + c_size]
-            v_chunk = v_ag[c_start : c_start + c_size]
-            k_chunk_3d = k_chunk[:, 0]  # shape: [c_size, nHeads, headDim]
-            v_chunk_3d = v_chunk[:, 0]  # shape: [c_size, nHeads, headDim]
+        # 3) Split local Q => front half + back half (per doc).
+        q_front_list = []
+        q_back_list  = []
+        offset_q = 0
+        for fsz, bsz in zip(local_front_sizes, local_back_sizes):
+            q_front_list.append(q[0, offset_q : offset_q+fsz])
+            q_back_list.append(q[0, offset_q+fsz : offset_q+fsz+bsz])
+            offset_q += (fsz + bsz)
+        q_front = torch.cat(q_front_list, dim=0).unsqueeze(0)  # => [B, s_front, nHeads, headDim]
+        q_back  = torch.cat(q_back_list, dim=0).unsqueeze(0)
 
-            # set up the cumulative sequence lengths and maximum sequence lengths for the variable-length forward call
-            cu_k = torch.tensor([0, c_size], device=k_ag.device, dtype=torch.int32)
-            max_seqlen_q = c_size
-            max_seqlen_k = c_size
+        # 4) Each rank's slice in k_ag, v_ag is from rank*T_local .. (rank+1)*T_local -1
+        offset_for_rank = rank * T_local
 
-            # execute the variable-length forward attention function
-            out_chunk, q_new, k_new, v_new, out_pad, softmax_lse, s_dmask, rng_state = fa_varlen_fwd(
-                q_chunk,
-                k_chunk_3d,
-                v_chunk_3d,
-                cu_q, 
-                cu_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                float(dropout_p),
-                float(softmax_scale if softmax_scale else 1.0),
-                bool(causal_bool),
+        # We'll build the same doc-based front/back shards from k_global, v_global,
+        # but each doc is within [offset_for_rank .. offset_for_rank+L_local].
+        global_front_k = []
+        global_back_k  = []
+        global_front_v = []
+        global_back_v  = []
+
+        offset_doc = offset_for_rank
+        for i, (fsz, bsz) in enumerate(zip(local_front_sizes, local_back_sizes)):
+            L_local = fsz + bsz  # local doc length
+            # front = [offset_doc : offset_doc+fsz]
+            # back  = [offset_doc + (L_local - bsz) : offset_doc+L_local]
+            global_front_k.append(k_ag[offset_doc : offset_doc + fsz])
+            global_back_k.append(k_ag[offset_doc + (L_local - bsz) : offset_doc + L_local])
+            global_front_v.append(v_ag[offset_doc : offset_doc + fsz])
+            global_back_v.append(v_ag[offset_doc + (L_local - bsz) : offset_doc + L_local])
+            offset_doc += L_local
+
+        k_front = torch.cat(global_front_k, dim=0).unsqueeze(1)  # => [s_front, B, nHeads, headDim]
+        k_back  = torch.cat(global_back_k, dim=0).unsqueeze(1)
+        v_front = torch.cat(global_front_v, dim=0).unsqueeze(1)
+        v_back  = torch.cat(global_back_v, dim=0).unsqueeze(1)
+
+        # 5) Flatten + varlen calls
+        cu_seqlens_front = torch.tensor([0, s_front], dtype=torch.int32, device=q.device)
+        cu_seqlens_back  = torch.tensor([0, s_back],  dtype=torch.int32, device=q.device)
+
+        # Flatten Q
+        q_front_2d = q_front.reshape(-1, nHeads, headDim)
+        k_front_2d = k_front.reshape(-1, nHeads, headDim)
+        v_front_2d = v_front.reshape(-1, nHeads, headDim)
+        q_back_2d  = q_back.reshape(-1, nHeads, headDim)
+        k_back_2d  = k_back.reshape(-1, nHeads, headDim)
+        v_back_2d  = v_back.reshape(-1, nHeads, headDim)
+
+        # Two calls
+        with torch.cuda.stream(torch.cuda.current_stream()):
+            out_front_2d, _, _, _, _, _, _, _ = fa_varlen_fwd(
+                q_front_2d, k_front_2d, v_front_2d,
+                cu_seqlens_front, cu_seqlens_front,
+                s_front, s_front,
+                dropout_p,
+                softmax_scale,
+                causal,
                 window_size,
-                None, 
+                None,
                 False
             )
-            # Insert the computed output chunk into the correct location in the output tensor.
-            out_4d[0, c_start : c_start + c_size] = out_chunk
-
-            # save the forward pass data for this chunk for use in the backward pass.
-            fwd_data[c_id] = (
-                out_chunk,      # output from the forward pass
-                softmax_lse,    # log-sum-exp values for softmax
-                q_chunk, k_chunk_3d, v_chunk_3d,
-                cu_q, cu_k, max_seqlen_q, max_seqlen_k,
-                rng_state
-            )
-
-        # Reshape the output tensor to 2D: [B, T, nHeads * headDim]
-        out_2d = out_4d.view(B, T, nHeads * headDim)
-
-        # Save tensors and context variables needed for the backward pass.
-        ctx.save_for_backward(q, k_ag, v_ag)
-        ctx.fwd_data       = fwd_data
-        ctx.chunk_ranges   = chunk_ranges
-        ctx.local_chunk_ids = local_chunk_ids
-        ctx.cp_group       = cp_group
-        ctx.nHeads         = nHeads
-        ctx.headDim        = headDim
-        ctx.dropout_p      = dropout_p
-        ctx.softmax_scale  = softmax_scale
-        ctx.causal_bool    = causal_bool
-        ctx.window_size    = window_size
-        ctx.T              = T
-        return out_2d
-
-    @staticmethod
-    def backward(ctx, dout):
-        (q, k_ag, v_ag) = ctx.saved_tensors
-        fwd_data        = ctx.fwd_data
-        chunk_ranges    = ctx.chunk_ranges
-        local_chunk_ids = ctx.local_chunk_ids
-        cp_group        = ctx.cp_group
-        nHeads          = ctx.nHeads
-        headDim         = ctx.headDim
-        dropout_p       = ctx.dropout_p
-        softmax_scale   = ctx.softmax_scale
-        causal_bool     = ctx.causal_bool
-        window_size     = ctx.window_size
-        T               = ctx.T
-
-        B, _, _, _ = q.shape
-        # Reshape dout to its 4D form with shape [B, T, nHeads, headDim]
-        dout_4d = dout.view(B, T, nHeads, headDim)
-        dQ_4d = torch.zeros_like(q)
-
-        # Extract the gathered key and value tensors by removing the batch dimension
-        k_ag_3d = k_ag[:, 0]  # shape: [cp_size*T, nHeads, headDim]
-        v_ag_3d = v_ag[:, 0]
-        dK_ag_3d = torch.zeros_like(k_ag_3d)
-        dV_ag_3d = torch.zeros_like(v_ag_3d)
-
-        def partial_accum_dout(c_start, c_size):
-            # Extract the gradient corresponding to a specific chunk
-            # Returns a tensor of shape [c_size, nHeads, headDim]
-            return dout_4d[0, c_start : c_start + c_size]
-
-        for c_id in local_chunk_ids:
-            chunk_info = fwd_data.get(c_id, None)
-            if chunk_info is None:
-                continue
-            (out_chunk, softmax_lse, q_chunk, k_chunk_3d, v_chunk_3d,
-             cu_q, cu_k, maxQ, maxK, rng_state) = chunk_info
-            c_start, c_size = chunk_ranges[c_id]
-            dout_chunk_3d = partial_accum_dout(c_start, c_size)
-
-            # Compute gradients for the current chunk using the variable-length backward function
-            dq_chunk, dk_chunk, dv_chunk, softmax_d = fa_varlen_bwd(
-                dout_chunk_3d,
-                q_chunk,
-                k_chunk_3d,
-                v_chunk_3d,
-                out_chunk,
-                softmax_lse,
-                None,
-                None,
-                None,
-                cu_q, cu_k,
-                maxQ, maxK,
-                float(dropout_p),
-                float(softmax_scale if softmax_scale else 1.0),
-                bool(causal_bool),
+        with torch.cuda.stream(cp_stream):
+            out_back_2d, _, _, _, _, _, _, _  = fa_varlen_fwd(
+                q_back_2d, k_back_2d, v_back_2d,
+                cu_seqlens_back, cu_seqlens_back,
+                s_back, s_back,
+                dropout_p,
+                softmax_scale,
+                causal,
                 window_size,
                 None,
-                True,
-                rng_state
+                False
             )
-            # accumulate the gradient for q into its corresponding slice
-            dQ_4d[0, c_start : c_start + c_size] += dq_chunk
+        torch.cuda.current_stream().wait_stream(cp_stream)
 
-            # accumulate the gradients for k and v into the corresponding slices
-            dK_ag_3d[c_start : c_start + c_size].add_(dk_chunk)
-            dV_ag_3d[c_start : c_start + c_size].add_(dv_chunk)
+        out_front_4d = out_front_2d.view(s_front, B, nHeads, headDim).transpose(0,1).contiguous()  # => [B, s_front, nHeads, headDim]
+        out_back_4d  = out_back_2d.view(s_back,  B, nHeads, headDim).transpose(0,1).contiguous()
 
-        # perform reduce-scatter on the accumulated gradients for k and v
-        dK_local_3d, _ = reduce_scatter_along_first_dim(dK_ag_3d, cp_group)
-        dV_local_3d, _ = reduce_scatter_along_first_dim(dV_ag_3d, cp_group)
-        # reshape the local gradients to match the original tensor shapes: [B, T, nHeads, headDim]
-        dK_4d = dK_local_3d.unsqueeze(1).movedim(0, 1).contiguous()
-        dV_4d = dV_local_3d.unsqueeze(1).movedim(0, 1).contiguous()
+        # 6) Reassemble doc by doc in correct order: front followed by back
+        #   so total => [B, T_local, nHeads, headDim]
+        outputs = []
+        front_idx = 0
+        back_idx  = 0
+        for fsz, bsz in zip(local_front_sizes, local_back_sizes):
+            doc_front = out_front_4d[:, front_idx : front_idx + fsz]
+            doc_back  = out_back_4d[:, back_idx  : back_idx  + bsz]
+            doc_out   = torch.cat([doc_front, doc_back], dim=1)
+            outputs.append(doc_out)
+            front_idx += fsz
+            back_idx  += bsz
 
-        return (
-            None,
-            dQ_4d,   # gradient for q with shape [B, T, nHeads, headDim]
-            dK_4d,   # gradient for k
-            dV_4d,   # gradient for v
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None
-        )
+        out = torch.cat(outputs, dim=1)  # => [B, T_local, nHeads, headDim]
+
+        nvtx_range_pop("AttnFuncWithAllGatherPerDocSharding.forward")
+        return out.to(torch.bfloat16)
