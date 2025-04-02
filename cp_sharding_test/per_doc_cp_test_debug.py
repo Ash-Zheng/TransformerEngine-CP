@@ -11,6 +11,10 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from per_document_cp_sharding.per_document_cp_sharding import AttnFuncWithAllGatherPerDocSharding
+try:
+    from flash_attn.flash_attn_interface import _flash_attn_forward as _flash_attn_fwd
+except ImportError:
+    _flash_attn_fwd = None
 
 def generate_global_tokens():
     """
@@ -86,71 +90,55 @@ def map_local_to_global(doc_lens, gathered_outputs):
     Args:
       doc_lens: a list of global document lengths [L0, L1, ..., L_{D-1}] for B=1.
                 Each Ld is assumed divisible by (2*cp_size).  
-      gathered_outputs: a list of length R (the cp world size), where 
-          gathered_outputs[r] is rank r's local output tensor of shape 
-          [1, local_sum, nHeads, headDim], with 
-          local_sum = sum_d (Ld // cp_size).
+      gathered_outputs: a list of length cp_size, where
+          gathered_outputs[r] is rank r's local output tensor of shape [1, local_sum, nHeads, headDim]
+          with local_sum = sum_d (Ld // cp_size).
     
-    For each document d, the local token count per worker is:
-         local_doc_len = Ld // cp_size.
-    Each worker’s local output for document d is assumed to be the concatenation of two shards,
-    each of length shard_len = Ld // (2*cp_size).
+    For each document d, let each worker’s local output have two shards:
+         front = first half (length = Ld//(2*cp_size))
+         back  = second half (length = Ld//(2*cp_size))
+    The global output for document d is assembled by concatenating:
+         [F[0], F[1], …, F[R-1], B[R-1], …, B[0]]
+    for each document, and then concatenating the documents in order.
     
-    The desired global token order for document d is:
-         F[0], F[1], …, F[R-1], B[R-1], B[R-2], …, B[0],
-    where for each worker r:
-         F[r] = first half of worker r’s local output for doc d,
-         B[r] = second half of worker r’s local output for doc d.
-    
-    The function processes each document in order and concatenates the results,
-    returning a tensor of shape [1, sum(Ld), nHeads, headDim] that has the tokens in the correct global order.
-    
-    Note: This implementation assumes B = 1.
+    This implementation assumes B = 1.
     """
-    cp_size = len(gathered_outputs)  # Number of CP workers (R)
-    
-    # Compute cumulative boundaries for each document in each worker's local output.
-    # Each document d has local length = Ld_local = Ld // cp_size.
+    cp_size = len(gathered_outputs)
+    # For each document, local doc length = Ld_local = Ld // cp_size.
+    # And each shard length = Ld_local // 2 = Ld // (2*cp_size).
+    shard_len_list = [L // (2 * cp_size) for L in doc_lens]
+    # Compute boundaries for each document in the local outputs.
     boundaries = [0]
     for L in doc_lens:
-        boundaries.append(boundaries[-1] + (L // (2 * cp_size)) * 2)  
-        # Because each doc is split into 2 shards per worker, so total tokens per doc per worker is Ld//cp_size.
-    
-    # Now, for each document, we reassemble from each worker.
+        boundaries.append(boundaries[-1] + (L // cp_size))
     reassembled_docs = []
-    # For each document d, local tokens per worker = Ld_local = Ld // cp_size.
-    # And each shard length = shard_len = Ld // (2 * cp_size).
     for d in range(len(doc_lens)):
-        shard_len = doc_lens[d] // (2 * cp_size)
-        # For each CP worker r, extract its portion for document d from gathered_outputs[r].
-        # The local output for document d in worker r is at positions:
-        #   start = boundaries[d], end = boundaries[d+1] (same for all workers)
-        doc_shards = []  # List of tensors from each worker, but each worker provides two shards.
+        front_shard_len = shard_len_list[d]
+        back_shard_len = shard_len_list[d]
+        # For each CP worker r, extract its portion for document d.
+        doc_shards = []
         for r in range(cp_size):
-            # gathered_outputs[r] is shape [1, total_local, nHeads, headDim]
-            local_doc = gathered_outputs[r][0, boundaries[d]:boundaries[d+1], :, :]  # shape [Ld_local, nHeads, headDim]
+            local_out = gathered_outputs[r][0]  # shape [local_sum, nHeads, headDim]
+            # The portion for document d is from boundaries[d] to boundaries[d+1].
+            doc_portion = local_out[boundaries[d]:boundaries[d+1], :, :]
             # Split into front and back halves.
-            front = local_doc[:shard_len, :, :]
-            back  = local_doc[shard_len:, :, :]
+            front = doc_portion[:front_shard_len, :, :]
+            back  = doc_portion[front_shard_len:, :, :]
             doc_shards.append((front, back))
-        # Now reassemble document d in the following order:
-        #   first, all front shards in order r = 0...R-1,
-        #   then all back shards in reverse order r = R-1...0.
+        # Assemble global document d: first shards in order, then back shards in reverse.
         front_parts = [doc_shards[r][0] for r in range(cp_size)]
         back_parts  = [doc_shards[r][1] for r in reversed(range(cp_size))]
-        doc_global = torch.cat(front_parts + back_parts, dim=0)  # shape [Ld_local * cp_size = Ld, nHeads, headDim]
+        doc_global = torch.cat(front_parts + back_parts, dim=0)
         reassembled_docs.append(doc_global)
-    # Finally, concatenate all document outputs.
-    global_out = torch.cat(reassembled_docs, dim=0).unsqueeze(0)  # shape [1, sum(Ld), nHeads, headDim]
+    global_out = torch.cat(reassembled_docs, dim=0).unsqueeze(0)
     return global_out
-
 
 def run(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
     torch.cuda.set_device(rank)
     
-    # Initialize NCCL distributed process group.
+    # Initialize NCCL process group.
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     cp_group = dist.new_group(ranks=list(range(world_size)))
     
@@ -173,11 +161,11 @@ def run(rank, world_size):
     v = q.clone()
     print(f"[Rank {rank}] Local token embeddings (squeezed to [B, T_local, 8]):\n{q.squeeze(2)}")
     
-    # Call the per-document forward pass (always in local mode).
+    # Call the per-document forward pass (local mode).
     local_doc_lens_nested = [local_doc_lens]  # e.g. [[4,8]]
     local_out = AttnFuncWithAllGatherPerDocSharding.apply(
         True,         # is_training
-        q,            # [B, T_local, 1, 8] (local tokens)
+        q,            # [B, T_local, 1, 8]
         k,            # k tensor
         v,            # v tensor
         local_doc_lens_nested,     # local document lengths
@@ -201,9 +189,31 @@ def run(rank, world_size):
     if rank == 0:
         global_out = map_local_to_global(global_doc_lens, gathered)
         print(f"[Rank {rank}] Global output (reassembled, shape {global_out.shape}):\n{global_out.squeeze(2)}")
-    
+        
     dist.destroy_process_group()
 
 if __name__ == "__main__":
     world_size = 2
-    mp.spawn(run, args=(world_size,), nprocs=world_size, join=True)
+    mp.spawn(run, args=(world_size,), nprocs=world_size)
+    
+    # --- Extra Section: Compare standard flash attention forward outside distributed setting ---
+    # This call is made in a non-distributed context.
+    global_tokens = generate_global_tokens().cuda()  # shape [1, 24]
+    global_q = embed_tokens(global_tokens)  # keep shape [1, 24, 1, 8]
+    global_k = global_q.clone()
+    global_v = global_q.clone()
+    global_out_std = _flash_attn_fwd(
+        q=global_q,
+        k=global_k,
+        v=global_v,
+        dropout_p=0.0,
+        softmax_scale=global_q.shape[-1] ** -0.5,
+        causal=True,
+        window_size=(0, 0),
+        alibi_slopes=None,
+        return_softmax=False
+    )
+    print(f"Standard flash attention forward (global) output (shape {global_out_std[0].shape}):\n{global_out_std[0]}")
+
+
+
