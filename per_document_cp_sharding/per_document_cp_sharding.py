@@ -29,7 +29,7 @@ class AttnFuncWithAllGatherPerDocSharding(Function):
         q,            # [B, T_local, nHeads, headDim] local Q
         k,
         v,
-        doc_lens,     # e.g. [[4,8]] if B=1
+        doc_lens,   
         dropout_p,
         softmax_scale,
         qkv_format,
@@ -54,8 +54,7 @@ class AttnFuncWithAllGatherPerDocSharding(Function):
         assert attn_bias_type == "no_bias", f"{attn_bias_type} not supported!"
 
         B, T_local, nHeads, headDim = q.shape
-        # e.g. if global doc lengths were [8,16] and cp_size=2 => local doc_lens = [4,8].
-        # We'll compute front/back shards for each doc in doc_lens[0].
+        # compute front/back shards for each doc in doc_lens[0].
 
         # 1) All-Gather local K, V => shape [cp_size*T_local, B, nHeads, headDim]
         k_4d = k.movedim(1, 0).contiguous()  # => [T_local, B, nHeads, headDim]
@@ -63,8 +62,8 @@ class AttnFuncWithAllGatherPerDocSharding(Function):
         k_ag, _ = gather_along_first_dim(k_4d, cp_group)  # => [cp_size*T_local, B, nHeads, headDim]
         v_ag, _ = gather_along_first_dim(v_4d, cp_group)
 
-        # 2) Flatten local Q => we'll eventually do 2 calls (front/back).
-        # But first we need to define front_size/back_size for each doc.
+        # 2) Flatten local Q => eventually do 2 calls (front/back).
+        # define front_size/back_size for each doc.
         local_front_sizes = []
         local_back_sizes  = []
         for L_local in doc_lens[0]:
@@ -177,5 +176,5 @@ class AttnFuncWithAllGatherPerDocSharding(Function):
     
     @staticmethod
     def backward():
-        # TODO: implement the backwards pass
+        # TODO: implement the backward pass
         return None
