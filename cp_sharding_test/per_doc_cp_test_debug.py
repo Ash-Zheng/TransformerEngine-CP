@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-# add project root to path 
+# add project root to path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -136,7 +136,7 @@ def map_local_to_global(doc_lens, gathered_outputs):
     
     For each document d, let each worker’s local output have two shards:
          front = first half (length = Ld//(2*cp_size))
-         back  = second half (length = Ld//(2*cp_size))
+         back:  second half (length = Ld//(2*cp_size))
     The global output for document d is assembled by concatenating:
          [F[0], F[1], …, F[R-1], B[R-1], …, B[0]]
     for each document, and then concatenating the documents in order.
@@ -190,13 +190,14 @@ def run(rank, world_size):
     print(f"[Rank {rank}] Local document lengths: {local_doc_lens}")
     
     # Embed local tokens.
-    q = local_embeddings  # shape [B, T_local, 1, 8]
-    k = q.clone()
-    v = q.clone()
+    # NOTE: We'll set requires_grad_ so we can do backward.
+    q = local_embeddings.clone().requires_grad_()  # shape [B, T_local, 1, 8]
+    k = q.clone().requires_grad_()
+    v = q.clone().requires_grad_()
     print(f"[Rank {rank}] Local token embeddings (shape {q.shape}):\n{q.squeeze(2)}")
     
     # Call the per-document forward pass (local mode).
-    local_doc_lens_nested = [local_doc_lens]
+    local_doc_lens_nested = [local_doc_lens]  # e.g. [[4,8]]
     local_out = AttnFuncWithAllGatherPerDocSharding.apply(
         True,         # is_training
         q,            # [B, T_local, 1, 8]
@@ -218,6 +219,15 @@ def run(rank, world_size):
     print(f"[Rank {rank}] Local output from per-document forward pass (shape: {local_out.shape}):\n{local_out}")
     torch.cuda.synchronize(device=rank)
 
+    # For demonstration: backprop a simple scalar loss from local_out.
+    # We'll just sum up local_out and call backward, then print gradients.
+    local_loss = local_out.float().sum()
+    local_loss.backward()
+
+    print(f"[Rank {rank}] Grad for local Q: {q.grad}")
+    print(f"[Rank {rank}] Grad for local K: {k.grad}")
+    print(f"[Rank {rank}] Grad for local V: {v.grad}")
+
     # Gather outputs from all CP workers.
     gathered = [torch.empty_like(local_out) for _ in range(world_size)]
     dist.all_gather(gathered, local_out)
@@ -233,9 +243,9 @@ if __name__ == "__main__":
     
     # --- Extra Section: Compare standard flash attention forward outside distributed setting ---
     global_tokens = generate_global_tokens().cuda()  # shape [1, 24]
-    global_q = embed_tokens(global_tokens)  # keep shape [1, 24, 1, 8]
-    global_k = global_q.clone()
-    global_v = global_q.clone()
+    global_q = embed_tokens(global_tokens).clone().requires_grad_()  # keep shape [1, 24, 1, 8]
+    global_k = global_q.clone().requires_grad_()
+    global_v = global_q.clone().requires_grad_()
     global_out_std = _flash_attn_fwd(
         q=global_q,
         k=global_k,
@@ -248,3 +258,11 @@ if __name__ == "__main__":
         return_softmax=False
     )
     print(f"Standard flash attention forward (global) output (shape {global_out_std[0].shape}):\n{global_out_std[0]}")
+
+    # Similarly, let's do a trivial backward pass on the standard output, printing gradients:
+    std_loss = global_out_std[0].float().sum()
+    std_loss.backward()
+
+    print("Standard flash attention Q grad:\n", global_q.grad)
+    print("Standard flash attention K grad:\n", global_k.grad)
+    print("Standard flash attention V grad:\n", global_v.grad)

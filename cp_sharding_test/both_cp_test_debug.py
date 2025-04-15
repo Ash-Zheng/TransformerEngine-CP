@@ -241,26 +241,29 @@ def run(rank, world_size):
     
     # We'll define 29 documents: one long doc of 100k tokens, plus 28 short docs of 1k each.
     # So total length T = 128,000
-    # doc_lens_doc = [100000] + [1000] * 28  # 100k + 28k => 128k
-    # # For the per-sequence approach, we treat all 128k tokens as a single doc
-    # doc_lens_seq = [128000]
-
-    # testing
-    doc_lens_doc = [8]
-    doc_lens_seq = [8]
+    doc_lens_doc = [100000] + [1000] * 28  # 100k + 28k => 128k
+    # For the per-sequence approach, we treat all 128k tokens as a single doc
+    doc_lens_seq = [128000]
 
     B = 1
     n_heads = 8
     head_dim = 64
     device = torch.device(rank)
 
-    ########################################################################
-    # Create one global embeddings tensor (bf16) with <eos> after each doc
-    # => The same input for both doc-based and seq-based CP.
-    ########################################################################
-    global_embeddings = generate_global_embeddings(
-        doc_lens_doc, B, n_heads, head_dim, device
-    )
+    if rank == 0:
+        # Create the global embeddings on rank 0 only:
+        global_embeddings = generate_global_embeddings(
+            doc_lens_doc, B, n_heads, head_dim, device
+        )
+    else:
+        # Allocate an empty tensor of the correct size on other ranks
+        T = sum(doc_lens_doc)
+        global_embeddings = torch.empty((B, T, n_heads, head_dim),
+                                        dtype=torch.bfloat16,
+                                        device=device)
+
+    # Now broadcast from rank 0 to all ranks:
+    dist.broadcast(global_embeddings, src=0)
 
     ########################################################################
     # Per-Document CP
@@ -342,6 +345,10 @@ def run(rank, world_size):
         cp_group,
         torch.cuda.current_stream()
     )
+    # if rank == 0:
+    #     print(out_seq)
+    gathered_input_seq = [torch.empty_like(local_seq_embeddings) for _ in range(world_size)]
+    dist.all_gather(gathered_input_seq, q_seq)
 
     ########################################################################
     # Gather outputs and reassemble on rank 0
@@ -360,8 +367,8 @@ def run(rank, world_size):
 
         diff_doc_seq = torch.norm(global_out_doc.float() - global_out_seq.float())
         print(f"[Rank 0] Global output L-2 diff (per-doc vs per-seq): {diff_doc_seq.item()}", flush=True)
-        # max_abs_diff = (global_out_doc.float() - global_out_seq.float()).abs().max()
-        # print(f"[Rank 0] Global output max abs diff (per-doc vs per-seq): {max_abs_diff.item()}", flush=True)
+        max_abs_diff = (global_out_doc.float() - global_out_seq.float()).abs().max()
+        print(f"[Rank 0] Global output max abs diff (per-doc vs per-seq): {max_abs_diff.item()}", flush=True)
 
     dist.destroy_process_group()
 
@@ -374,7 +381,9 @@ def run(rank, world_size):
         global_k_std = global_embeddings.clone()
         global_v_std = global_embeddings.clone()
 
-        print(f"All input tensors are same: {torch.equal(global_q_std, global_embeddings)}", flush=True)
+        # print(f"[Rank 0] Global Q shape: {global_q_std.shape}, tensor: {global_q_std.squeeze(2)}", flush=True)
+
+        # print(f"All input tensors are same: {torch.equal(global_q_std, global_embeddings)}", flush=True)
 
         global_out_std = _flash_attn_fwd(
             q=global_q_std,
@@ -389,16 +398,18 @@ def run(rank, world_size):
         )
         global_out_std_tensor = global_out_std[0]  # [B, T, nHeads, headDim]
 
+        # print(global_out_std_tensor - global_out_seq)
+
         diff_seq_std = torch.norm(global_out_seq.float() - global_out_std_tensor.float())
         print(f"[Rank 0] Global output L-2 diff (per-seq vs standard): {diff_seq_std.item()}", flush=True)
-        # max_abs_diff_std = (global_out_seq.float() - global_out_std_tensor.float()).abs().max()
-        # print(f"[Rank 0] Global output max abs diff (per-seq vs standard): {max_abs_diff_std.item()}", flush=True)
+        max_abs_diff_std = (global_out_seq.float() - global_out_std_tensor.float()).abs().max()
+        print(f"[Rank 0] Global output max abs diff (per-seq vs standard): {max_abs_diff_std.item()}", flush=True)
 
         if 'global_out_doc' in locals():
             diff_doc_std = torch.norm(global_out_doc.float() - global_out_std_tensor.float())
             print(f"[Rank 0] Global output L-2 diff (per-doc vs standard): {diff_doc_std.item()}", flush=True)
-            # max_abs_diff_doc_std = (global_out_doc.float() - global_out_std_tensor.float()).abs().max()
-            # print(f"[Rank 0] Global output max abs diff (per-doc vs standard): {max_abs_diff_doc_std.item()}", flush=True)
+            max_abs_diff_doc_std = (global_out_doc.float() - global_out_std_tensor.float()).abs().max()
+            print(f"[Rank 0] Global output max abs diff (per-doc vs standard): {max_abs_diff_doc_std.item()}", flush=True)
 
     elif rank == 0:
         print("[Rank 0] Warning: flash_attn is not available; skipping standard attention comparison.")

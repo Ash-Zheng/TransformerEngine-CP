@@ -221,7 +221,7 @@ def run(rank, world_size):
     dist.destroy_process_group()
 
 if __name__ == "__main__":
-    world_size = 2
+    world_size = 4
     mp.spawn(run, args=(world_size,), nprocs=world_size, join=True)
     
     # --- Extra Section: Compare standard flash attention forward outside distributed setting ---

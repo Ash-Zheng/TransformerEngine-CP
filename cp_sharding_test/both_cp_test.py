@@ -5,7 +5,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-# add project root to path 
+# Add project root to path 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -20,90 +20,123 @@ try:
 except ImportError:
     _flash_attn_fwd = None
 
-#########################################
-# Utility Functions
-#########################################
+###########################################################################
+# 1) Sharding Functions
+###########################################################################
 
-def generate_global_tokens():
+def global_to_local_doc_embeddings(global_embeddings: torch.Tensor,
+                                   global_doc_lens: list[list[int]],
+                                   rank: int,
+                                   cp_size: int
+                                  ) -> torch.Tensor:
     """
-    Generate a global token sequence.
-    In each document, the last token is -1 (eos).
-    """
-    tokens = []
-    doc_lens = [1000, 100, 100, 100, 100, 100, 100, 100, 100]
-    total_tokens = 0
-    for i in range(len(doc_lens)):
-        # generate doc tokens, last token is -1 (eos)
-        doc_tokens = list(range(total_tokens, total_tokens + doc_lens[i] - 1))
-        doc_tokens.append(-1)
-        tokens.extend(doc_tokens)
-        total_tokens += doc_lens[i]
-    return torch.tensor([tokens], dtype=torch.int64)
+    Shard a globally-embedded tensor by documents, returning the local shard
+    for a particular CP rank.
 
-def embed_tokens(tokens):
-    """
-    Embeds tokens into vectors of size 8x64.
-    Each token is mapped to a vector of size 8x64 with all entries equal to the token id (as float).
-    The output shape is [B, T, 8, 64] and is converted to bfloat16.
-    """
-    B, T = tokens.shape
-    emb = tokens.float().unsqueeze(-1).unsqueeze(-1).expand(B, T, 8, 64)
-    return emb.to(torch.bfloat16)
+    Args:
+      global_embeddings: shape [B, T, nHeads, headDim].
+      global_doc_lens: a list of lists, where global_doc_lens[b] is
+         the per-document lengths for sample b.
+      rank: The current CP rank (0 to cp_size-1).
+      cp_size: the context-parallel group size.
 
-#########################################
-# Per-document Mapping Helpers
-#########################################
+    Returns:
+      A tensor of shape [B, T_local, nHeads, headDim].
+    """
+    num_chunks = 2 * cp_size
+    B = global_embeddings.shape[0]
 
-def global_to_local_doc(global_tokens, global_doc_lens, rank, cp_size):
-    """
-    Maps a global token tensor (shape [B, T]) to local tokens for per-document CP.
-    global_doc_lens is a list (for B=1) of document lengths, e.g. [1000, 100, 100, ...].
-    For cp_size=2 (num_chunks=4), each document is split into 4 equal contiguous chunks.
-      - For rank 0: local tokens = concatenation of chunk0 and chunk3.
-      - For rank 1: local tokens = concatenation of chunk1 and chunk2.
-    Returns a tensor of shape [B, T_local] where T_local = sum_d (L_d // cp_size).
-    """
-    B, T = global_tokens.shape
-    num_chunks = 2 * cp_size  # 4
-    local_tokens_list = []
+    local_shards_per_sample = []
+
     for b in range(B):
-        tokens = global_tokens[b]
-        local_doc_list = []
-        start = 0
-        for L in global_doc_lens[b]:
-            doc = tokens[start:start+L]
-            base = L // num_chunks  # assumes divisible
-            chunks = [doc[j*base:(j+1)*base] for j in range(num_chunks)]
-            if rank == 0:
-                local_doc = torch.cat([chunks[0], chunks[num_chunks - 1]], dim=0)
-            else:
-                local_doc = torch.cat([chunks[rank], chunks[num_chunks - 1 - rank]], dim=0)
-            local_doc_list.append(local_doc)
-            start += L
-        local_tokens_list.append(torch.cat(local_doc_list, dim=0).unsqueeze(0))
-    return torch.cat(local_tokens_list, dim=0)
+        sample_embed = global_embeddings[b]  # shape [T, nHeads, headDim]
+        doc_lens_for_b = global_doc_lens[b]
+
+        local_doc_shards = []
+        seq_start = 0
+        for L in doc_lens_for_b:
+            chunk_size = L // num_chunks
+            chunks = []
+            for c in range(num_chunks):
+                cstart = seq_start + c * chunk_size
+                cend = seq_start + (c + 1) * chunk_size
+                chunks.append(sample_embed[cstart : cend])
+
+            local_front_chunk = chunks[rank]
+            local_back_chunk = chunks[num_chunks - 1 - rank]
+            local_doc = torch.cat([local_front_chunk, local_back_chunk], dim=0)
+            local_doc_shards.append(local_doc)
+
+            seq_start += L
+
+        local_sample_shard = torch.cat(local_doc_shards, dim=0).unsqueeze(0)
+        local_shards_per_sample.append(local_sample_shard)
+
+    local_embeddings = torch.cat(local_shards_per_sample, dim=0)
+    return local_embeddings
+
+def global_to_local_seq_embeddings(
+    global_embeddings: torch.Tensor,
+    global_doc_lens: list[list[int]],
+    rank: int,
+    cp_size: int
+) -> torch.Tensor:
+    """
+    Shard a globally-embedded tensor for a per-sequence CP split.
+    
+    For each document length L, assume L is divisible by 2*cp_size.
+    Split into 2*cp_size chunks. The local shard for rank r is:
+        [chunk[r], chunk[2*cp_size - 1 - r]]
+    Concatenate shards across documents in order.
+
+    Args:
+      global_embeddings: shape [B, T, nHeads, headDim].
+      global_doc_lens: a list of lists of doc lengths
+      rank: current CP rank.
+      cp_size: context-parallel group size.
+
+    Returns:
+      [B, T_local, nHeads, headDim].
+    """
+    B = global_embeddings.shape[0]
+    num_chunks = 2 * cp_size
+    local_shards_per_sample = []
+
+    for b in range(B):
+        sample_embed = global_embeddings[b]  # shape [T, nHeads, headDim]
+        doc_lens_for_b = global_doc_lens[b]
+        local_doc_shards = []
+        seq_start = 0
+
+        for L in doc_lens_for_b:
+            chunk_size = L // num_chunks
+            doc_embed = sample_embed[seq_start : seq_start + L]
+            seq_start += L
+
+            chunks = [doc_embed[i * chunk_size : (i+1)*chunk_size]
+                      for i in range(num_chunks)]
+            local_doc = torch.cat([chunks[rank], chunks[num_chunks - 1 - rank]], dim=0)
+            local_doc_shards.append(local_doc)
+
+        local_sample_shard = torch.cat(local_doc_shards, dim=0).unsqueeze(0)
+        local_shards_per_sample.append(local_sample_shard)
+
+    local_embeddings = torch.cat(local_shards_per_sample, dim=0)
+    return local_embeddings
+
+###########################################################################
+# 2) Reassembly Helpers (unchanged from original)
+###########################################################################
 
 def compute_local_doc_lens(global_doc_lens, cp_size, rank):
     """
     For per-document CP, each document's local length = global_length // cp_size.
-    For example, if global_doc_lens = [1000, 100, 100, ...] and cp_size=2,
-    then local_doc_lens = [500, 50, 50, ...].
     """
     return [L // cp_size for L in global_doc_lens]
 
-def map_local_to_global_doc(doc_lens, gathered_outputs):
+def map_local_to_global(doc_lens, gathered_outputs):
     """
     Reassemble the global output from gathered local outputs for per-document CP.
-    
-    Args:
-      doc_lens: a list of global document lengths,
-      gathered_outputs: list of length cp_size, where gathered_outputs[r] is of shape [1, local_sum, nHeads, headDim],
-          with local_sum = sum_d (L_d // cp_size).
-    
-    For each document d, each worker’s local output is split into two equal halves (front and back),
-    where each half has length L_d // (2 * cp_size). The global output for document d is assembled by:
-       [front from worker 0, front from worker 1, …, front from worker (R-1),
-        back from worker (R-1), …, back from worker 0].
     """
     cp_size = len(gathered_outputs)
     shard_len_list = [L // (2 * cp_size) for L in doc_lens]
@@ -127,53 +160,9 @@ def map_local_to_global_doc(doc_lens, gathered_outputs):
     global_out = torch.cat(reassembled_docs, dim=0).unsqueeze(0)
     return global_out
 
-#########################################
-# Per-sequence Mapping Helpers
-#########################################
-
-def global_to_local_seq_custom(global_tokens, global_doc_lens, rank, cp_size):
-    """
-    Implements the per-sequence global-to-local mapping with symmetric sharding.
-    For each document in global_tokens with length L (from global_doc_lens), assume L is divisible by 2*cp_size.
-    Split the document into num_chunks = 2*cp_size contiguous chunks (each of length L_chunk = L // (2*cp_size)).
-    Then, for a CP worker with rank r, local tokens = concat( chunk[r], chunk[2*cp_size - 1 - r] ).
-    For multiple documents (B=1), do this for each document and concatenate.
-    Returns a tensor of shape [B, T_local] where T_local = sum_d (L_d // cp_size).
-    """
-    B, T = global_tokens.shape
-    local_tokens_list = []
-    for b in range(B):
-        tokens = global_tokens[b]
-        doc_tokens_list = []
-        start = 0
-        for L in global_doc_lens[b]:
-            doc = tokens[start:start+L]
-            num_chunks = 2 * cp_size
-            L_chunk = L // num_chunks
-            chunks = [doc[i*L_chunk:(i+1)*L_chunk] for i in range(num_chunks)]
-            local_doc = torch.cat([chunks[rank], chunks[num_chunks - 1 - rank]], dim=0)
-            doc_tokens_list.append(local_doc)
-            start += L
-        local_tokens_list.append(torch.cat(doc_tokens_list, dim=0).unsqueeze(0))
-    return torch.cat(local_tokens_list, dim=0)
-
 def map_local_to_global_seq_custom(doc_lens, gathered_outputs):
     """
     Reassemble the global output from gathered local outputs for per-sequence CP using symmetric reordering.
-    
-    Args:
-      doc_lens: a list of global document lengths [L0, L1, ..., L_{D-1}] for B=1.
-                Each L is assumed divisible by (2 * cp_size).
-      gathered_outputs: list of length cp_size, where each tensor is of shape [T_local, nHeads, headDim],
-          with T_local = sum_d (L_d // cp_size).
-    
-    For each document d, each worker’s local slice (length = L_d_local = L_d // cp_size) is split evenly into:
-         front: first half (length = L_d // (2*cp_size))
-         back:  second half (length = L_d // (2*cp_size))
-    The global order for document d is:
-         [front from worker 0, front from worker 1, …, front from worker (R-1),
-          back from worker (R-1), …, back from worker 0]
-    Returns a tensor of shape [1, sum_d L_d, nHeads, headDim].
     """
     cp_size = len(gathered_outputs)
     shard_len_list = [L // (2 * cp_size) for L in doc_lens]
@@ -197,42 +186,114 @@ def map_local_to_global_seq_custom(doc_lens, gathered_outputs):
     global_out = torch.cat(reassembled_docs, dim=0).unsqueeze(0)
     return global_out
 
-#########################################
-# Distributed Run Function
-#########################################
+###########################################################################
+# 3) Global Embeddings Generation
+###########################################################################
 
-def run(rank, world_size):
+def generate_global_embeddings(
+    doc_lens: list[int],
+    B: int,
+    n_heads: int,
+    head_dim: int,
+    device: torch.device
+) -> torch.Tensor:
+    """
+    Create random bf16 embeddings [B, T, n_heads, head_dim],
+    where T = sum(doc_lens). Mark each document's *last token* as -1.0
+    across all heads/dim (indicating <eos>).
+
+    doc_lens: list of doc lengths
+    B: batch size (usually 1 here).
+    n_heads: number of heads.
+    head_dim: dimension per head.
+    device: GPU device.
+
+    Returns:
+      global_embeddings: [B, T, n_heads, head_dim], dtype=bfloat16
+    """
+    T = sum(doc_lens)
+    global_embeddings = torch.randn(
+        (B, T, n_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device
+    )
+    # Mark <eos> for each doc's last token
+    seq_start = 0
+    for length in doc_lens:
+        eos_idx = seq_start + length - 1
+        global_embeddings[0, eos_idx, :, :] = -1.0
+        seq_start += length
+
+    return global_embeddings
+
+###########################################################################
+# 4) Main Distributed Run
+###########################################################################
+
+def run(rank, world_size, scenario_doc, scenario_seq, scenario_name):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
     torch.cuda.set_device(rank)
     
-    # Initialize NCCL distributed process group.
+    # Initialize NCCL process group.
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     cp_group = dist.new_group(ranks=list(range(world_size)))
     
-    ###############################
-    # Per-document Forward Pass
-    ###############################
-    # Use global_doc_lens_doc consistent with generate_global_tokens().
-    global_doc_lens_doc = [1000, 100, 100, 100, 100, 100, 100, 100, 100]
-    global_tokens_doc = generate_global_tokens() 
-    global_tokens_doc = global_tokens_doc.cuda()  # shape [1, 1800]
-    
-    # Compute local tokens for per-document CP.
-    local_tokens_doc = global_to_local_doc(global_tokens_doc, [global_doc_lens_doc], rank, world_size)
-    q_doc = embed_tokens(local_tokens_doc)  # shape [B, T_local, 8, 64]
-    k_doc = q_doc.clone()
-    v_doc = q_doc.clone()
-    local_doc_lens = compute_local_doc_lens(global_doc_lens_doc, world_size, rank) 
-    local_doc_lens_nested = [local_doc_lens]  # Now a list of lengths per document
+    # Use scenario parameters passed from main.
+    doc_lens_doc = scenario_doc
+    doc_lens_seq = scenario_seq
+
+    B = 1
+    n_heads = 8
+    head_dim = 64
+    device = torch.device(rank)
+
+    if rank == 0:
+        # Create the global embeddings on rank 0 only:
+        global_embeddings = generate_global_embeddings(
+            doc_lens_doc, B, n_heads, head_dim, device
+        )
+    else:
+        # Allocate an empty tensor of the correct size on other ranks
+        T = sum(doc_lens_doc)
+        global_embeddings = torch.empty((B, T, n_heads, head_dim),
+                                        dtype=torch.bfloat16,
+                                        device=device)
+
+    # Now broadcast from rank 0 to all ranks:
+    dist.broadcast(global_embeddings, src=0)
+
+    if rank == 0:
+        print("=" * 80, flush=True)
+        print(f"Testing {scenario_name}", flush=True)
+
+    ########################################################################
+    # Per-Document CP
+    ########################################################################
+    # Shard
+    local_doc_embeddings = global_to_local_doc_embeddings(
+        global_embeddings,
+        [doc_lens_doc],  # shape: [B, #docs]
+        rank,
+        world_size
+    )
+    # We pass the same local embeddings as Q, K, V
+    q_doc = local_doc_embeddings
+    k_doc = local_doc_embeddings.clone()
+    v_doc = local_doc_embeddings.clone()
+
+    # Compute local doc_lens
+    local_doc_lens = compute_local_doc_lens(doc_lens_doc, world_size, rank)
+    local_doc_lens_nested = [local_doc_lens]
+
     out_doc = AttnFuncWithAllGatherPerDocSharding.apply(
-        True,         # is_training
-        q_doc,        # [B, T_local, 8, 64]
+        True,
+        q_doc,
         k_doc,
         v_doc,
         local_doc_lens_nested,
         0.0,
-        None,
+        global_embeddings.shape[-1] ** -0.5,
         "bshd",
         "causal",
         "no_bias",
@@ -243,22 +304,28 @@ def run(rank, world_size):
         cp_group,
         torch.cuda.current_stream()
     )
-    
-    ###############################
-    # Per-sequence Forward Pass
-    ###############################
-    global_doc_lens_seq = [1000 + 100 + 100 + 100 + 100 + 100 + 100 + 100 + 100]
-    global_tokens_seq = generate_global_tokens() 
-    global_tokens_seq = global_tokens_seq.cuda()  
-    local_tokens_seq = global_to_local_seq_custom(global_tokens_seq, [global_doc_lens_seq], rank, world_size)
-    q_seq = embed_tokens(local_tokens_seq)  # shape [B, T_local, 8, 64]
+
+    ########################################################################
+    # Per-Sequence CP
+    ########################################################################
+    local_seq_embeddings = global_to_local_seq_embeddings(
+        global_embeddings,
+        [doc_lens_seq],
+        rank,
+        world_size
+    )
+    q_seq = local_seq_embeddings.clone()
     k_seq = q_seq.clone()
     v_seq = q_seq.clone()
+
     T_local_seq = q_seq.shape[1]
+    # maximum local doc length
     max_seqlen_q = T_local_seq * world_size
-    max_seqlen_kv = T_local_seq * world_size
-    cu_seqlens_q = torch.tensor([0, max_seqlen_q], device=q_seq.device, dtype=torch.int32)
+    max_seqlen_kv = max_seqlen_q
+
+    cu_seqlens_q = torch.tensor([0, max_seqlen_q], device=device, dtype=torch.int32)
     cu_seqlens_q_padded = None
+
     out_seq = AttnFuncWithCPAndKVAllGather.apply(
         True,
         q_seq,
@@ -269,7 +336,7 @@ def run(rank, world_size):
         max_seqlen_kv,
         cu_seqlens_q_padded,
         0.0,
-        None,
+        global_embeddings.shape[-1] ** -0.5,
         "bshd",
         "causal",
         "no_bias",
@@ -280,46 +347,101 @@ def run(rank, world_size):
         cp_group,
         torch.cuda.current_stream()
     )
-    
-    # Gather outputs.
+    # if rank == 0:
+    #     print(out_seq)
+    gathered_input_seq = [torch.empty_like(local_seq_embeddings) for _ in range(world_size)]
+    dist.all_gather(gathered_input_seq, q_seq)
+
+    ########################################################################
+    # Gather outputs and reassemble on rank 0
+    ########################################################################
     gathered_doc = [torch.empty_like(out_doc) for _ in range(world_size)]
     gathered_seq = [torch.empty_like(out_seq) for _ in range(world_size)]
     dist.all_gather(gathered_doc, out_doc)
     dist.all_gather(gathered_seq, out_seq)
+
     if rank == 0:
-        global_out_doc = map_local_to_global_doc(global_doc_lens_doc, gathered_doc)
-        global_out_seq = map_local_to_global_seq_custom(global_doc_lens_seq, gathered_seq)
-        diff_doc_seq = torch.norm(global_out_doc.float() - global_out_seq.float())
-        print(f"[Rank {rank}] Global output difference (per-doc vs per-seq): {diff_doc_seq.item()}", flush=True)
-    
+        # Print scenario header
+        global_out_doc = map_local_to_global(doc_lens_doc, gathered_doc)
+        global_out_seq = map_local_to_global_seq_custom(doc_lens_seq, gathered_seq)
+
+        print(f"[Rank 0] Global doc input shape: {global_embeddings.shape}", flush=True)
+        print(f"[Rank 0] Global seq input shape: {global_embeddings.shape}", flush=True)
+
+        # Commented out L2 diff print (as requested)
+        # diff_doc_seq = torch.norm(global_out_doc.float() - global_out_seq.float())
+        # print(f"[Rank 0] Global output L-2 diff (per-doc vs per-seq): {diff_doc_seq.item()}", flush=True)
+        max_abs_diff = (global_out_doc.float() - global_out_seq.float()).abs().max()
+        print(f"[Rank 0] Global output max abs diff (per-doc vs per-seq): {max_abs_diff.item()}", flush=True)
+
     dist.destroy_process_group()
-    
-    #####################################
-    # Extra Section: Standard Flash-Attn
-    #####################################
-    # Outside distributed setting, standard flash attention forward uses the full global embedding.
-    global_tokens_std = generate_global_tokens().cuda()  # shape [1, 1800]
-    global_q_std = embed_tokens(global_tokens_std)  # shape [1, 1800, 8, 64]
-    global_k_std = global_q_std.clone()
-    global_v_std = global_q_std.clone()
-    global_out_std = _flash_attn_fwd(
-        q=global_q_std,
-        k=global_k_std,
-        v=global_v_std,
-        dropout_p=0.0,
-        softmax_scale=global_q_std.shape[-1] ** -0.5,
-        causal=True,
-        window_size=(0, 0),
-        alibi_slopes=None,
-        return_softmax=False
-    )
-    global_out_std_tensor = global_out_std[0]
-    if rank == 0:
-        diff_seq_std = torch.norm(global_out_seq.float() - global_out_std_tensor.float())
-        diff_doc_std = torch.norm(global_out_doc.float() - global_out_std_tensor.float())
-        print(f"[Rank {rank}] Global output difference (per-seq vs standard): {diff_seq_std.item()}", flush=True)
-        print(f"[Rank {rank}] Global output difference (per-doc vs standard): {diff_doc_std.item()}", flush=True)
+
+    ########################################################################
+    # Compare with Standard Flash Attention
+    ########################################################################
+    if rank == 0 and _flash_attn_fwd is not None:
+        # We'll reuse the same global_embeddings as Q, K, V for a single doc
+        global_q_std = global_embeddings.clone()
+        global_k_std = global_embeddings.clone()
+        global_v_std = global_embeddings.clone()
+
+        global_out_std = _flash_attn_fwd(
+            q=global_q_std,
+            k=global_k_std,
+            v=global_v_std,
+            dropout_p=0.0,
+            softmax_scale=global_q_std.shape[-1] ** -0.5,
+            causal=True,
+            window_size=(0, 0),
+            alibi_slopes=None,
+            return_softmax=False
+        )
+        global_out_std_tensor = global_out_std[0]  # [B, T, nHeads, headDim]
+
+        # diff_seq_std = torch.norm(global_out_seq.float() - global_out_std_tensor.float())
+        # print(f"[Rank 0] Global output L-2 diff (per-seq vs standard): {diff_seq_std.item()}", flush=True)
+        max_abs_diff_std = (global_out_seq.float() - global_out_std_tensor.float()).abs().max()
+        print(f"[Rank 0] Global output max abs diff (per-seq vs standard): {max_abs_diff_std.item()}", flush=True)
+
+        if 'global_out_doc' in locals():
+            # diff_doc_std = torch.norm(global_out_doc.float() - global_out_std_tensor.float())
+            # print(f"[Rank 0] Global output L-2 diff (per-doc vs standard): {diff_doc_std.item()}", flush=True)
+            max_abs_diff_doc_std = (global_out_doc.float() - global_out_std_tensor.float()).abs().max()
+            print(f"[Rank 0] Global output max abs diff (per-doc vs standard): {max_abs_diff_doc_std.item()}", flush=True)
+
+    elif rank == 0:
+        print("[Rank 0] Warning: flash_attn is not available; skipping standard attention comparison.")
 
 if __name__ == "__main__":
-    world_size = 2
-    mp.spawn(run, args=(world_size,), nprocs=world_size, join=True)
+    world_size = 8
+    # Define the test scenarios.
+    # Scenario 1: One single document that fills the whole context (128k tokens, using 1024*128)
+    scenario1_doc = [1024 * 128]
+    scenario1_seq = [1024 * 128]
+    scenario1_name = "Scenario 1: One single document of 128k length"
+
+    # Scenario 2: 128 short documents of 1k length (using 1024 tokens each for exact 128*1024)
+    scenario2_doc = [1024] * 128
+    scenario2_seq = [1024 * 128]
+    scenario2_name = "Scenario 2: 128 short documents of 1k length"
+
+    # Scenario 3: Mixed - one long document of 100k tokens, then 28 short documents of 1k tokens
+    scenario3_doc = [100 * 1024] + [1024] * 28
+    scenario3_seq = [100 * 1024 + 1024 * 28]
+    scenario3_name = "Scenario 3: Mixed: one long document of 100k tokens, then 28 documents of 1k length"
+
+    # Scenario 4: Alternating - alternate between long documents of 32k tokens and short documents of 1k tokens.
+    scenario4_doc = [31 * 1024, 1024, 31 * 1024, 1024, 31 * 1024, 1024, 31 * 1024, 1024]
+    scenario4_seq = [31 * 1024 + 1024 + 31 * 1024 + 1024 + 31 * 1024 + 1024 + 31 * 1024 + 1024]
+    scenario4_name = "Scenario 4: Alternating: Long docs of 32k and short docs of 1k tokens"
+
+    scenarios = [
+        (scenario1_name, scenario1_doc, scenario1_seq),
+        (scenario2_name, scenario2_doc, scenario2_seq),
+        (scenario3_name, scenario3_doc, scenario3_seq),
+        (scenario4_name, scenario4_doc, scenario4_seq)
+    ]
+
+    for name, doc_lens, seq_lens in scenarios:
+        # Spawn the processes for this scenario, passing the parameters explicitly.
+        mp.spawn(run, args=(world_size, doc_lens, seq_lens, name), nprocs=world_size, join=True)
