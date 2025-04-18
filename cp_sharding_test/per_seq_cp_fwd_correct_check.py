@@ -30,11 +30,11 @@ from transformer_engine.pytorch.attention import AttnFuncWithCPAndKVAllGather
 from per_document_cp_sharding.per_document_cp_sharding import AttnFuncWithAllGatherPerDocSharding
 
 
-try:
-    from flash_attn.flash_attn_interface import _flash_attn_forward as _flash_attn_fwd
-    from flash_attn.flash_attn_interface import flash_attn_varlen_func
-except ImportError:
-    _flash_attn_fwd = None
+from flash_attn.flash_attn_interface import (
+    _flash_attn_varlen_forward,
+    _flash_attn_varlen_backward,
+)
+
 
 def compute_global_fwd_result( 
     q, k, v, doc_lens, softmax_scale=None
@@ -45,7 +45,7 @@ def compute_global_fwd_result(
     cu_seqlens_k = cu_seqlens.clone()
     softmax_scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
 
-    output = flash_attn_varlen_func(
+    out, lse, _, _, _, _, _, _ = _flash_attn_varlen_forward(
         q=q,
         k=k,
         v=v,
@@ -56,10 +56,12 @@ def compute_global_fwd_result(
         dropout_p=0.0,
         softmax_scale=softmax_scale,
         causal=True,
-        return_attn_probs=False
+        window_size=(0, 0),
+        return_softmax=False,
+        alibi_slopes=None,
     )
 
-    return output
+    return out, lse
 
 def compute_per_seq_metadate(context_length, q, k, v, doc_lens, cp_size, rank, chunk_id):
     """
@@ -229,7 +231,9 @@ if __name__ == "__main__":
     v_tensor = torch.randn((context_length * batch_size, num_heads, head_dim), dtype=torch.bfloat16, device=device)
 
     # simulate cp attention 
-    ref_result = compute_global_fwd_result(q_tensor, k_tensor, v_tensor, doc_lens, softmax_scale)
+    ref_out, ref_lse = compute_global_fwd_result(q_tensor, k_tensor, v_tensor, doc_lens, softmax_scale)
+    # to save local out and lse
+    rank_chunk_fwd_state = [[None, None] for _ in range(cp_size)]
 
     # compute per_seq cp attention
     for test_rank_id in range(cp_size):
@@ -245,7 +249,7 @@ if __name__ == "__main__":
                 chunk_id=test_chunk_id
             )
 
-            local_result = flash_attn_varlen_func(
+            local_out, local_lse, _, _, _, _, _, _ = _flash_attn_varlen_forward(
                 q=local_q,
                 k=local_k,
                 v=local_v,
@@ -256,10 +260,105 @@ if __name__ == "__main__":
                 dropout_p=0.0,
                 softmax_scale=softmax_scale,
                 causal=True,
-                return_attn_probs=False
+                window_size=(0, 0),
+                alibi_slopes=None,
+                return_softmax=False,
             )
 
+            rank_chunk_fwd_state[test_rank_id][test_chunk_id] = (local_out, local_lse)
+
             # compare result
-            local_ref_result = get_local_ref_result(ref_result, cp_size, rank=test_rank_id, chunk_id=test_chunk_id)
-            torch.testing.assert_close(local_ref_result, local_result)
-            print(f"Rank {test_rank_id}, Chunk {test_chunk_id}: Pass", flush=True)
+            local_ref_result = get_local_ref_result(ref_out, cp_size, rank=test_rank_id, chunk_id=test_chunk_id)
+            torch.testing.assert_close(local_ref_result, local_out)
+            print(f"Rank {test_rank_id}, Chunk {test_chunk_id}: Forward Pass Passed Tests", flush=True)
+
+    # backward pass test
+    max_len    = torch.tensor([max(doc_lens)], dtype=torch.int32, device=q_tensor.device)
+    cu_seqlens = torch.tensor([0] + list(accumulate(doc_lens)), dtype=torch.int32, device=q_tensor.device)
+    d_out = torch.randn_like(ref_out, dtype=torch.bfloat16, device=q_tensor.device)
+
+    dq_ref = torch.zeros_like(q_tensor)
+    dk_ref = torch.zeros_like(k_tensor)
+    dv_ref = torch.zeros_like(v_tensor)
+    
+    # compute reference global backward
+    _flash_attn_varlen_backward(
+        d_out,                      # dout
+        q_tensor, k_tensor, v_tensor,
+        ref_out,                    # out
+        ref_lse,                    # softmax_lse
+        dq_ref, dk_ref, dv_ref,
+        cu_seqlens, cu_seqlens,     # cu_seqlens_q / cu_seqlens_k
+        int(max_len), int(max_len), # max_seqlen_q / max_seqlen_k
+        0.0,                        # dropout_p
+        softmax_scale,
+        True,                       # causal
+        (0, 0),                     # window_size
+        None,                       # alibi_slopes
+        False,                      # deterministic
+        None,                       # rng_state
+    )
+    
+    # compute per-sequence backward
+    chunk_size = context_length // (2 * cp_size)
+
+    for test_rank_id in range(cp_size):
+        for test_chunk_id in range(2):
+            # -------- metadata reused from earlier ---------------------
+            local_q, local_k, local_v, cu_seqlens_q, cu_seqlens_k, \
+                max_seqlen_q, max_seqlen_k = compute_per_seq_metadate(
+                    context_length,
+                    q_tensor, k_tensor, v_tensor,
+                    doc_lens,
+                    cp_size,
+                    rank=test_rank_id,
+                    chunk_id=test_chunk_id
+                )
+
+            # get saved forward out and lse
+            local_out, local_lse = rank_chunk_fwd_state[test_rank_id][test_chunk_id]
+
+            # slicing
+            idx = test_rank_id if test_chunk_id == 0 else 2 * cp_size - 1 - test_rank_id
+            d_out_chunk = d_out[idx * chunk_size : (idx + 1) * chunk_size]
+
+            # allocate grad buffers
+            dq_local = torch.zeros_like(local_q)
+            dk_local = torch.zeros_like(local_k)
+            dv_local = torch.zeros_like(local_v)
+
+            # backward kernel
+            _flash_attn_varlen_backward(
+                d_out_chunk,
+                local_q, local_k, local_v,
+                local_out,
+                local_lse,
+                dq_local, dk_local, dv_local,
+                cu_seqlens_q, cu_seqlens_k,
+                int(max_seqlen_q), int(max_seqlen_k),
+                0.0,
+                softmax_scale,
+                True,
+                (0, 0),
+                None,
+                False,
+                None,
+            )
+            torch.testing.assert_close(
+                dq_ref[idx * chunk_size:(idx + 1) * chunk_size],
+                dq_local
+            )
+
+            torch.testing.assert_close(
+                dk_ref[idx * chunk_size:(idx + 1) * chunk_size],
+                dk_local
+            )
+
+            torch.testing.assert_close(
+                dv_ref[idx * chunk_size:(idx + 1) * chunk_size],
+                dv_local
+            )
+
+            print(f"Rank {test_rank_id}, Chunk {test_chunk_id}: Backward Pass Passed Tests", flush=True)
+    print("All tests passed!", flush=True)
+
