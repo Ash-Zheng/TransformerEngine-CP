@@ -28,7 +28,11 @@ def is_package_installed(package):
 
 def get_te_path():
     """Find Transformer Engine install path using pip"""
-    return Path(transformer_engine.__path__[0]).parent
+    te_path = os.environ.get("GLOBAL_TE_PATH")
+    if te_path:
+        return Path(te_path)
+    else:
+        return Path(transformer_engine.__path__[0]).parent
 
 
 def _get_sys_extension():
@@ -82,7 +86,11 @@ def _load_cudnn():
 def _load_library():
     """Load shared library with Transformer Engine C extensions"""
 
+
     so_path = get_te_path() / "transformer_engine" / f"libtransformer_engine.{_get_sys_extension()}"
+    # so_path = get_te_path() / "build/cmake" / f"libtransformer_engine.{_get_sys_extension()}"
+    # so_path = get_te_path() / "build/lib.linux-x86_64-cpython-312/transformer_engine" / f"libtransformer_engine.{_get_sys_extension()}"
+
     if not so_path.exists():
         so_path = (
             get_te_path()
@@ -90,8 +98,10 @@ def _load_library():
             / "wheel_lib"
             / f"libtransformer_engine.{_get_sys_extension()}"
         )
+        # print("update so_path", so_path)
     if not so_path.exists():
         so_path = get_te_path() / f"libtransformer_engine.{_get_sys_extension()}"
+
     assert so_path.exists(), f"Could not find libtransformer_engine.{_get_sys_extension()}"
 
     return ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
