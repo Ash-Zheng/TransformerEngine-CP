@@ -22,3 +22,8 @@ export GLOBAL_TE_PATH="/workspace/TransformerEngine/build/lib.linux-x86_64-cpyth
 ```
 ./run_per_seq_test.sh
 ```
+
+### Run per-doc CP forward local test:
+```
+./run_per_doc_test.sh
+```
