@@ -33,6 +33,7 @@ from per_document_cp_sharding.per_document_cp_sharding import AttnFuncWithAllGat
 from flash_attn.flash_attn_interface import (
     _flash_attn_varlen_forward,
     _flash_attn_varlen_backward,
+    flash_attn_varlen_func,
 )
 
 
@@ -45,7 +46,7 @@ def compute_global_fwd_result(
     cu_seqlens_k = cu_seqlens.clone()
     softmax_scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
 
-    out, lse, _, _, _, _, _, _ = _flash_attn_varlen_forward(
+    output, lse, _ = flash_attn_varlen_func(
         q=q,
         k=k,
         v=v,
@@ -56,12 +57,10 @@ def compute_global_fwd_result(
         dropout_p=0.0,
         softmax_scale=softmax_scale,
         causal=True,
-        window_size=(0, 0),
-        return_softmax=False,
-        alibi_slopes=None,
+        return_attn_probs=True
     )
 
-    return out, lse
+    return output, lse # return out, lse
 
 def compute_per_seq_metadate(context_length, q, k, v, doc_lens, cp_size, rank, chunk_id):
     """
@@ -136,7 +135,7 @@ def compute_per_seq_metadate(context_length, q, k, v, doc_lens, cp_size, rank, c
     cu_seqlens_k = torch.tensor([0] + list(accumulate(this_chunk_docs)), dtype=torch.int32).to(q.device)
     max_seqlen_k = torch.tensor([max(this_chunk_docs)], dtype=torch.int32).to(q.device)
    
-    return local_q, local_k, local_v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
+    return local_q, local_k, local_v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, k_offset
 
 
 def get_local_ref_result(global_ref_result, cp_size, rank, chunk_id):
@@ -232,13 +231,20 @@ if __name__ == "__main__":
 
     # simulate cp attention 
     ref_out, ref_lse = compute_global_fwd_result(q_tensor, k_tensor, v_tensor, doc_lens, softmax_scale)
-    # to save local out and lse
+
+    # prechunk q to get q offsets
+    q_chunks = q_tensor.chunk(2 * cp_size, dim=0)
+    q_offsets = [0]
+    for i in range(2 * cp_size):
+        q_offsets.append(q_offsets[-1] + q_chunks[i].shape[0])
+
+    # to save forward data
     rank_chunk_fwd_state = [[None, None] for _ in range(cp_size)]
 
     # compute per_seq cp attention
     for test_rank_id in range(cp_size):
         for test_chunk_id in range(2):
-            local_q, local_k, local_v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = compute_per_seq_metadate(
+            local_q, local_k, local_v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, k_offset = compute_per_seq_metadate(
                 context_length, 
                 q_tensor, 
                 k_tensor, 
@@ -248,8 +254,15 @@ if __name__ == "__main__":
                 rank=test_rank_id, 
                 chunk_id=test_chunk_id
             )
+            if test_chunk_id == 0:
+                chunk_index = test_rank_id
+            else:
+                chunk_index = 2 * cp_size - 1 - test_rank_id
+            q_offset = q_offsets[chunk_index]
+            local_q_len = local_q.shape[0]
+            local_k_len = local_k.shape[0]
 
-            local_out, local_lse, _, _, _, _, _, _ = _flash_attn_varlen_forward(
+            local_out, local_lse, _ = flash_attn_varlen_func(
                 q=local_q,
                 k=local_k,
                 v=local_v,
@@ -260,17 +273,30 @@ if __name__ == "__main__":
                 dropout_p=0.0,
                 softmax_scale=softmax_scale,
                 causal=True,
-                window_size=(0, 0),
-                alibi_slopes=None,
-                return_softmax=False,
+                return_attn_probs=True
             )
 
-            rank_chunk_fwd_state[test_rank_id][test_chunk_id] = (local_out, local_lse)
+            rank_chunk_fwd_state[test_rank_id][test_chunk_id] = {
+            "local_q": local_q,
+            "local_k": local_k,
+            "local_v": local_v,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": cu_seqlens_k,
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_k,
+            "q_offset": q_offset,
+            "k_offset": k_offset,
+            "q_len": local_q_len,
+            "k_len": local_k_len,
+            "local_out": local_out,
+            "local_lse": local_lse,
+        }
 
             # compare result
             local_ref_result = get_local_ref_result(ref_out, cp_size, rank=test_rank_id, chunk_id=test_chunk_id)
             torch.testing.assert_close(local_ref_result, local_out)
             print(f"Rank {test_rank_id}, Chunk {test_chunk_id}: Forward Pass Passed Tests", flush=True)
+
 
     # backward pass test
     max_len    = torch.tensor([max(doc_lens)], dtype=torch.int32, device=q_tensor.device)
@@ -302,25 +328,32 @@ if __name__ == "__main__":
     # compute per-sequence backward
     chunk_size = context_length // (2 * cp_size)
 
+    # to store grad results
+    dq_computed = torch.zeros_like(q_tensor)
+    dk_computed = torch.zeros_like(k_tensor)
+    dv_computed = torch.zeros_like(v_tensor)
+
     for test_rank_id in range(cp_size):
         for test_chunk_id in range(2):
-            # -------- metadata reused from earlier ---------------------
-            local_q, local_k, local_v, cu_seqlens_q, cu_seqlens_k, \
-                max_seqlen_q, max_seqlen_k = compute_per_seq_metadate(
-                    context_length,
-                    q_tensor, k_tensor, v_tensor,
-                    doc_lens,
-                    cp_size,
-                    rank=test_rank_id,
-                    chunk_id=test_chunk_id
-                )
+            info = rank_chunk_fwd_state[test_rank_id][test_chunk_id]
 
-            # get saved forward out and lse
-            local_out, local_lse = rank_chunk_fwd_state[test_rank_id][test_chunk_id]
+            local_q = info["local_q"]
+            local_k = info["local_k"]
+            local_v = info["local_v"]
+            local_out = info["local_out"]
+            local_lse = info["local_lse"]
+            cu_seqlens_q = info["cu_seqlens_q"]
+            cu_seqlens_k = info["cu_seqlens_k"]
+            max_seqlen_q = info["max_seqlen_q"]
+            max_seqlen_k = info["max_seqlen_k"]
+
+            q_offset = info["q_offset"]
+            k_offset = info["k_offset"]
+            q_len    = info["q_len"]
+            k_len    = info["k_len"]
 
             # slicing
-            idx = test_rank_id if test_chunk_id == 0 else 2 * cp_size - 1 - test_rank_id
-            d_out_chunk = d_out[idx * chunk_size : (idx + 1) * chunk_size]
+            d_out_chunk = d_out[q_offset : q_offset + q_len]
 
             # allocate grad buffers
             dq_local = torch.zeros_like(local_q)
@@ -344,21 +377,18 @@ if __name__ == "__main__":
                 False,
                 None,
             )
-            torch.testing.assert_close(
-                dq_ref[idx * chunk_size:(idx + 1) * chunk_size],
-                dq_local
-            )
+            # calculate dq directly
+            dq_computed [q_offset : q_offset + q_len] = dq_local
 
-            torch.testing.assert_close(
-                dk_ref[idx * chunk_size:(idx + 1) * chunk_size],
-                dk_local
-            )
+            # accumulate dk and dv
+            dk_computed [k_offset : k_offset + k_len] += dk_local
+            dv_computed [k_offset : k_offset + k_len] += dv_local
 
-            torch.testing.assert_close(
-                dv_ref[idx * chunk_size:(idx + 1) * chunk_size],
-                dv_local
-            )
+    # compare results
+    torch.testing.assert_close(dq_ref, dq_computed)
+    torch.testing.assert_close(dk_ref, dk_computed)
+    torch.testing.assert_close(dv_ref, dv_computed)
 
-            print(f"Rank {test_rank_id}, Chunk {test_chunk_id}: Backward Pass Passed Tests", flush=True)
+    print(f"Backward Pass Passed Tests", flush=True)
     print("All tests passed!", flush=True)
 
