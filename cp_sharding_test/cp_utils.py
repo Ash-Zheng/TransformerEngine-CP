@@ -144,10 +144,11 @@ def kv_shuffle_for_per_doc_cp(context_length, k_tensor_list, v_tensor_list, doc_
     """
     chunk_size = context_length // (2 * cp_size)
     global_cu_lens =  [0] + list(accumulate(doc_lens))
-    global_k = [[] for _ in range(2 * cp_size)]
-    global_v = [[] for _ in range(2 * cp_size)]
-    for rank in range(cp_size):
-        for chunk_id in range(2):
+    global_k = [[] for _ in range(len(doc_lens))]
+    global_v = [[] for _ in range(len(doc_lens))]
+    for chunk_id in range(2):
+        rank_range = range(cp_size) if chunk_id == 0 else range(cp_size - 1, -1, -1)
+        for rank in rank_range:
             if chunk_id == 0:
                 chunk_index = rank
             else:
@@ -155,6 +156,7 @@ def kv_shuffle_for_per_doc_cp(context_length, k_tensor_list, v_tensor_list, doc_
 
             k_tensor = k_tensor_list[rank][chunk_id * chunk_size:(chunk_id + 1) * chunk_size, :, :]
             v_tensor = v_tensor_list[rank][chunk_id * chunk_size:(chunk_id + 1) * chunk_size, :, :] if v_tensor_list is not None else None
+
 
             this_doc_shards = doc_shards[chunk_index]
             offset = 0
@@ -164,10 +166,9 @@ def kv_shuffle_for_per_doc_cp(context_length, k_tensor_list, v_tensor_list, doc_
                     this_doc_v = v_tensor[offset:offset + doc_shard_i.shard_len, :, :] if v_tensor is not None else None
                     offset += doc_shard_i.shard_len
 
-                    global_k[chunk_index].append(this_doc_k)
+                    global_k[doc_shard_i.doc_id].append(this_doc_k)
                     if v_tensor is not None:
-                        global_v[chunk_index].append(this_doc_v)
-
+                        global_v[doc_shard_i.doc_id].append(this_doc_v)
 
     # Concatenate the tensors for each chunk
     flat_k = [k_chunk for sub in global_k for k_chunk in sub]
@@ -180,8 +181,7 @@ def kv_shuffle_for_per_doc_cp(context_length, k_tensor_list, v_tensor_list, doc_
     else:
         shuffled_v_tensor = None
 
-    # assert shuffled_k_tensor.shape[0] == context_length, f"shuffled_k_tensor shape {shuffled_k_tensor.shape[0]} must equals context length {context_length}."
-    print("shuffled_k_tensor shape:", shuffled_k_tensor.shape)
+    assert shuffled_k_tensor.shape[0] == context_length, f"shuffled_k_tensor shape {shuffled_k_tensor.shape[0]} must equals context length {context_length}."
                     
     return shuffled_k_tensor, shuffled_v_tensor
 
