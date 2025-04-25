@@ -201,7 +201,6 @@ def generate_doc_lens(avg_doc_len, std_doc_len, context_length, divide_cp=1):
 
     return doc_lens
 
-
 if __name__ == "__main__":
     args = parser.parse_args()
     
@@ -232,12 +231,6 @@ if __name__ == "__main__":
     # simulate cp attention 
     ref_out, ref_lse = compute_global_fwd_result(q_tensor, k_tensor, v_tensor, doc_lens, softmax_scale)
 
-    # prechunk q to get q offsets
-    q_chunks = q_tensor.chunk(2 * cp_size, dim=0)
-    q_offsets = [0]
-    for i in range(2 * cp_size):
-        q_offsets.append(q_offsets[-1] + q_chunks[i].shape[0])
-
     # to save forward data
     rank_chunk_fwd_state = [[None, None] for _ in range(cp_size)]
 
@@ -258,7 +251,7 @@ if __name__ == "__main__":
                 chunk_index = test_rank_id
             else:
                 chunk_index = 2 * cp_size - 1 - test_rank_id
-            q_offset = q_offsets[chunk_index]
+            q_offset = chunk_index * (context_length // (2 * cp_size))
             local_q_len = local_q.shape[0]
             local_k_len = local_k.shape[0]
 
@@ -277,20 +270,20 @@ if __name__ == "__main__":
             )
 
             rank_chunk_fwd_state[test_rank_id][test_chunk_id] = {
-            "local_q": local_q,
-            "local_k": local_k,
-            "local_v": local_v,
-            "cu_seqlens_q": cu_seqlens_q,
-            "cu_seqlens_k": cu_seqlens_k,
-            "max_seqlen_q": max_seqlen_q,
-            "max_seqlen_k": max_seqlen_k,
-            "q_offset": q_offset,
-            "k_offset": k_offset,
-            "q_len": local_q_len,
-            "k_len": local_k_len,
-            "local_out": local_out,
-            "local_lse": local_lse,
-        }
+                "local_q": local_q,
+                "local_k": local_k,
+                "local_v": local_v,
+                "cu_seqlens_q": cu_seqlens_q,
+                "cu_seqlens_k": cu_seqlens_k,
+                "max_seqlen_q": max_seqlen_q,
+                "max_seqlen_k": max_seqlen_k,
+                "q_offset": q_offset,
+                "k_offset": k_offset,
+                "q_len": local_q_len,
+                "k_len": local_k_len,
+                "local_out": local_out,
+                "local_lse": local_lse,
+            }
 
             # compare result
             local_ref_result = get_local_ref_result(ref_out, cp_size, rank=test_rank_id, chunk_id=test_chunk_id)
@@ -377,10 +370,9 @@ if __name__ == "__main__":
                 False,
                 None,
             )
-            # calculate dq directly
-            dq_computed [q_offset : q_offset + q_len] = dq_local
 
-            # accumulate dk and dv
+            # accumulate gradients
+            dq_computed [q_offset : q_offset + q_len] += dq_local
             dk_computed [k_offset : k_offset + k_len] += dk_local
             dv_computed [k_offset : k_offset + k_len] += dv_local
 
